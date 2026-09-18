@@ -230,7 +230,15 @@ if [ "$WIFI_DEV_READY" -ne 1 ]; then
 fi
 
 log "Checking if WiFi is already connected..."
-CURRENT_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d':' -f2)
+WIFI_IFACE=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi" {print $1; exit}')
+ACTIVE_WIFI_CONNECTION=""
+CURRENT_SSID=""
+if [ -n "$WIFI_IFACE" ]; then
+    ACTIVE_WIFI_CONNECTION=$(nmcli -g GENERAL.CONNECTION device show "$WIFI_IFACE" 2>/dev/null || true)
+    if [ -n "$ACTIVE_WIFI_CONNECTION" ] && [ "$ACTIVE_WIFI_CONNECTION" != "--" ]; then
+        CURRENT_SSID=$(nmcli -g 802-11-wireless.ssid connection show "$ACTIVE_WIFI_CONNECTION" 2>/dev/null || true)
+    fi
+fi
 if [ "$CURRENT_SSID" = "$UNOQ_WIFI_SSID" ]; then
     log "Already connected to WiFi SSID: $UNOQ_WIFI_SSID"
 else
@@ -238,8 +246,7 @@ else
     nmcli dev wifi rescan 2>/dev/null || true
 
     log "Connecting to WiFi..."
-    wifi_command="nmcli dev wifi connect $UNOQ_WIFI_SSID password $UNOQ_WIFI_PASSWORD"
-    log "WiFi command: $wifi_command"
+    log "Running nmcli dev wifi connect for SSID: $UNOQ_WIFI_SSID"
 
     # Retry budget: up to 15 * 4s = 60s. Covers "radio not up yet", "SSID not
     # seen in the first scan", and slow driver init after a cold boot.
@@ -249,12 +256,30 @@ else
     WIFI_CONNECTED=0
 
     while [ "$WIFI_ATTEMPT" -le "$WIFI_RETRY_MAX" ]; do
-        WIFI_OUTPUT=$(nmcli dev wifi connect "$UNOQ_WIFI_SSID" password "$UNOQ_WIFI_PASSWORD" 2>&1)
+        WIFI_OUTPUT=$(nmcli dev wifi connect "$UNOQ_WIFI_SSID" password "$UNOQ_WIFI_PASSWORD" ${WIFI_IFACE:+ifname "$WIFI_IFACE"} 2>&1)
         WIFI_EXIT_CODE=$?
 
         if [ "$WIFI_EXIT_CODE" -eq 0 ]; then
             WIFI_CONNECTED=1
             break
+        fi
+
+        if echo "$WIFI_OUTPUT" | grep -Fq "802-11-wireless-security.key-mgmt: property is missing"; then
+            PROFILE_NAME="unoq-${WIFI_IFACE:-wifi}"
+            log "NetworkManager omitted WPA key management; creating an explicit WPA-PSK profile..."
+            nmcli connection delete "$PROFILE_NAME" >/dev/null 2>&1 || true
+            WIFI_OUTPUT=$(nmcli connection add type wifi ifname "${WIFI_IFACE:-'*'}" \
+                con-name "$PROFILE_NAME" ssid "$UNOQ_WIFI_SSID" \
+                wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$UNOQ_WIFI_PASSWORD" 2>&1)
+            WIFI_EXIT_CODE=$?
+            if [ "$WIFI_EXIT_CODE" -eq 0 ]; then
+                WIFI_OUTPUT=$(nmcli connection up "$PROFILE_NAME" 2>&1)
+                WIFI_EXIT_CODE=$?
+            fi
+            if [ "$WIFI_EXIT_CODE" -eq 0 ]; then
+                WIFI_CONNECTED=1
+                break
+            fi
         fi
 
         if echo "$WIFI_OUTPUT" | grep -Fq "No Wi-Fi device found."; then
@@ -387,4 +412,8 @@ fi
 log "Running arduino-app-cli system update..."
 if ! arduino-app-cli system update --yes --only-arduino; then
    add_error "arduino-app-cli system update failed"
+fi
+
+if [ ${#ERRORS[@]} -gt 0 ]; then
+    exit 1
 fi

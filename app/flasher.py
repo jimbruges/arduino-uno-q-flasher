@@ -38,6 +38,9 @@ PROPERTIES_TARGET_PATHS = (
 APPS_TARGET_DIR = "/home/arduino/ArduinoApps/"
 REMOTE_SETUP_SCRIPT_PATH = f"/home/arduino/.{SETUP_SCRIPT_NAME}"
 REMOTE_ENV_PATH = "/home/arduino/.env"
+MODEL_BUNDLES_DIR_NAME = "model-bundles"
+REMOTE_MODELS_DIR = "/var/lib/arduino-app-cli/models"
+REMOTE_MODEL_STAGING_DIR = "/home/arduino/.unoq-model-bundles"
 
 PASSWORD_SUCCESS_RE = re.compile(
     r"password updated successfully"
@@ -145,6 +148,13 @@ class FlasherContext:
         candidate2 = self.project_root / PROPERTIES_FILE_NAME
         if candidate2.is_file():
             return candidate2
+        return None
+
+    @property
+    def model_bundle_dir(self) -> Path | None:
+        candidate = self.project_root / MODEL_BUNDLES_DIR_NAME
+        if candidate.is_dir() and any(candidate.iterdir()):
+            return candidate
         return None
 
 
@@ -392,7 +402,69 @@ async def _run_stages(
             f"source /etc/profile; bash {REMOTE_SETUP_SCRIPT_PATH}",
             line_cb_run_setup,
         )
-        return rc == 0
+        if rc != 0:
+            return False
+
+        setup_result, _ = parser.finish()
+        if setup_result is not None and setup_result.status == "FAILED":
+            return False
+
+        model_bundle = ctx.model_bundle_dir
+        if model_bundle is None:
+            await log(
+                "No local model-bundles directory; skipping model restore.",
+                stage="run_setup",
+            )
+            return True
+
+        await log(
+            f"Restoring offline model bundle to {REMOTE_MODELS_DIR}...",
+            stage="run_setup",
+        )
+        rc, _ = await adb.shell(
+            serial,
+            f"rm -rf {REMOTE_MODEL_STAGING_DIR} && "
+            f"mkdir -p {REMOTE_MODEL_STAGING_DIR}",
+            line_cb_run_setup,
+        )
+        if rc != 0:
+            return False
+        for model_family in model_bundle.iterdir():
+            if not model_family.is_dir():
+                continue
+            rc, _ = await adb.push(
+                serial,
+                model_family,
+                f"{REMOTE_MODEL_STAGING_DIR}/",
+                line_cb_run_setup,
+            )
+            if rc != 0:
+                return False
+
+        install_cmd = (
+            f"mkdir -p {REMOTE_MODELS_DIR} && "
+            f"cp -a {REMOTE_MODEL_STAGING_DIR}/. {REMOTE_MODELS_DIR}/ && "
+            f"chown -R arduino:arduino {REMOTE_MODELS_DIR} && "
+            f"rm -rf {REMOTE_MODEL_STAGING_DIR}"
+        )
+        sudo_candidates = [ctx.unoq_default_password, "arduino"]
+        rc, _ = await adb.shell(
+            serial,
+            f"sudo -n bash -lc {shlex.quote(install_cmd)}",
+            line_cb_run_setup,
+        )
+        if rc == 0:
+            return True
+        for password in dict.fromkeys(p for p in sudo_candidates if p):
+            rc, _ = await adb.shell(
+                serial,
+                f"printf '%s\\n' {shlex.quote(password)} | "
+                f"sudo -S -k -p '' bash -lc {shlex.quote(install_cmd)}",
+                line_cb_run_setup,
+            )
+            if rc == 0:
+                return True
+        return False
 
     if not await run_stage("run_setup", stage_run_setup, required=True):
         await _emit_summary(serial, parser, emit)

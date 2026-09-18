@@ -83,6 +83,23 @@ Open <http://localhost:8000>.
 
 The staged upload is removed from disk automatically once the run finishes.
 
+## Offline Edge LLM model deployment
+
+The App Lab **Chat with a Local LLM** example uses
+`llamacpp:Qwen3.5-0.8B-Q4_0` (507 MB). Export it once from a board where App Lab
+has installed the model:
+
+```bash
+chmod +x export-edge-llm-model.sh
+./export-edge-llm-model.sh SOURCE_BOARD_SERIAL
+```
+
+This creates the ignored local bundle `model-bundles/llamacpp/`, containing the
+GGUF and `models.ini`. Both the web flasher and `uno-q-update.sh` automatically
+push this bundle to `/var/lib/arduino-app-cli/models/` after the system update.
+App Lab then recognizes the model as installed without downloading it on each
+board. The deployment does not start the LLM example.
+
 ## Workflow (per device)
 
 The web app has a 9-stage workflow. Any stage can be skipped by Step 3
@@ -97,7 +114,8 @@ selection (or per-device skip toggles where applicable):
 6. `push_properties` — push `properties.msgpack` to
    `/home/arduino/.local/share/arduino-app-cli/` and `/tmp/` so on-device
    setup-wizard markers are in place before setup runs (skippable; skipped if absent)
-7. `run_setup` — execute the remote setup script (WiFi, DNS, system update)
+7. `run_setup` — execute the remote setup script (WiFi, DNS, system update),
+   then restore `model-bundles/` when present
 8. `prune_docker_images` — optional cleanup of unused Docker/Podman images and
    stopped containers before post-update (disabled by default)
 9. `post_update` — run configured post-update commands on the device, one line
