@@ -139,7 +139,7 @@ class FlasherContext:
         post_update_cmd: str | None = None,
         prune_docker_before_post_update: bool = False,
         use_package_cache: bool = True,
-        max_parallel_updates: int = 4,
+        max_parallel_updates: int = 2,
         prepare_uploaded_app: bool = False,
         example_apps: list[str] | None = None,
     ) -> None:
@@ -477,6 +477,16 @@ async def _run_stages(
     await run_stage("push_properties", stage_push_properties, required=False)
 
     async def restore_workshop_images(stage: Stage) -> bool:
+        async def free_disk_kb() -> int:
+            rc, output = await adb.shell(
+                serial,
+                "df -Pk / | awk 'NR==2 {print $4}'",
+            )
+            try:
+                return int(output.strip().splitlines()[-1]) if rc == 0 else 0
+            except (IndexError, ValueError):
+                return 0
+
         archive = ctx.docker_image_archive
         if archive is None:
             await log(
@@ -509,18 +519,18 @@ async def _run_stages(
                 )
                 return True
         required_free_kb = archive.stat().st_size // 1024 + 1024 * 1024
-        rc, free_output = await adb.shell(
-            serial,
-            "df -Pk / | awk 'NR==2 {print $4}'",
-            cb,
-        )
-        try:
-            free_kb = int(free_output.strip().splitlines()[-1]) if rc == 0 else 0
-        except (IndexError, ValueError):
-            free_kb = 0
+        free_kb = await free_disk_kb()
+        if not free_kb:
+            await log(
+                "Could not determine free disk space before workshop image restore.",
+                stage=stage,
+                stream="stderr",
+            )
+            return False
         if free_kb and free_kb < required_free_kb:
             await log(
-                "Reclaiming unused Docker data before workshop image restore...",
+                f"Workshop image restore needs {required_free_kb // 1024} MB free; "
+                f"{free_kb // 1024} MB is available. Reclaiming unused Docker data...",
                 stage=stage,
             )
             rc, _ = await adb.shell(
@@ -530,18 +540,30 @@ async def _run_stages(
             )
             if rc != 0:
                 return False
-            rc, free_output = await adb.shell(
-                serial,
-                "df -Pk / | awk 'NR==2 {print $4}'",
-                cb,
-            )
-            try:
-                free_kb = int(free_output.strip().splitlines()[-1]) if rc == 0 else 0
-            except (IndexError, ValueError):
-                free_kb = 0
-            if free_kb and free_kb < required_free_kb:
+            # Docker/containerd can release deleted layer files after the prune
+            # command exits. Give that cleanup time to reach the filesystem.
+            for wait_seconds in range(0, 61, 2):
+                free_kb = await free_disk_kb()
+                if free_kb >= required_free_kb:
+                    if wait_seconds:
+                        await log(
+                            f"Docker cleanup released enough space after {wait_seconds}s "
+                            f"({free_kb // 1024} MB free).",
+                            stage=stage,
+                        )
+                    break
+                if wait_seconds == 60:
+                    break
+                if wait_seconds == 0:
+                    await log(
+                        "Waiting for Docker layer cleanup to release disk space...",
+                        stage=stage,
+                    )
+                await asyncio.sleep(2)
+            if free_kb < required_free_kb:
                 await log(
-                    "Insufficient disk space for workshop image restore after cleanup.",
+                    f"Insufficient disk space for workshop image restore after cleanup: "
+                    f"{free_kb // 1024} MB free, {required_free_kb // 1024} MB required.",
                     stage=stage,
                     stream="stderr",
                 )
@@ -633,7 +655,11 @@ async def _run_stages(
                 stage="run_setup",
             )
 
-        setup_command = f"source /etc/profile; bash {REMOTE_SETUP_SCRIPT_PATH}"
+        host_epoch = int(time.time())
+        setup_command = (
+            f"export UNOQ_HOST_EPOCH={host_epoch}; "
+            f"source /etc/profile; bash {REMOTE_SETUP_SCRIPT_PATH}"
+        )
         if cache_configured:
             setup_command = (
                 f"export UNOQ_APT_CACHE_URL=http://127.0.0.1:{CACHE_PORT}; "

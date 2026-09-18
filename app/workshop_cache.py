@@ -22,6 +22,9 @@ class WorkshopCache:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         self._capture_lock = asyncio.Lock()
+        self._capture_all_lock = asyncio.Lock()
+        self._verified_signature: tuple | None = None
+        self._verification: dict = {"integrity": "unchecked", "integrity_errors": []}
 
     @property
     def image_archive(self) -> Path:
@@ -45,6 +48,10 @@ class WorkshopCache:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
+        signature = self._archive_signature()
+        verification = self._verification
+        if signature != self._verified_signature:
+            verification = {"integrity": "unchecked", "integrity_errors": []}
         return {
             "images_ready": self.image_archive.is_file(),
             "image_archive_bytes": (
@@ -70,7 +77,64 @@ class WorkshopCache:
                 else 0
             ),
             "app_runtime_sha256": manifest.get("app_runtime_sha256"),
+            **verification,
         }
+
+    async def verify(self) -> dict:
+        signature = self._archive_signature()
+        if signature == self._verified_signature:
+            return self.status()
+        async with self._capture_lock:
+            signature = self._archive_signature()
+            if signature != self._verified_signature:
+                errors = await asyncio.to_thread(self._verify_archives)
+                self._verified_signature = signature
+                self._verification = {
+                    "integrity": "invalid" if errors else "verified",
+                    "integrity_errors": errors,
+                    "verified_at": int(time.time()),
+                }
+        return self.status()
+
+    def _archive_signature(self) -> tuple:
+        return tuple(
+            (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+            for path in (self.image_archive, self.arduino_archive, self.app_runtime_archive)
+            if path.is_file()
+        )
+
+    def _verify_archives(self) -> list[str]:
+        manifest = self._read_manifest()
+        checks = (
+            (self.image_archive, "sha256", _validate_docker_archive),
+            (
+                self.arduino_archive,
+                "arduino_sha256",
+                lambda path: _validate_tar_archive(path, ".arduino15/"),
+            ),
+            (
+                self.app_runtime_archive,
+                "app_runtime_sha256",
+                lambda path: _validate_tar_archive(path, "/.cache/"),
+            ),
+        )
+        errors: list[str] = []
+        for archive, digest_key, validator in checks:
+            if not archive.is_file():
+                continue
+            expected = manifest.get(digest_key)
+            if not expected:
+                errors.append(f"{archive.name}: checksum is missing from manifest")
+                continue
+            actual = _sha256(archive)
+            if actual != expected:
+                errors.append(f"{archive.name}: checksum does not match")
+                continue
+            try:
+                validator(archive)
+            except (OSError, ValueError) as exc:
+                errors.append(f"{archive.name}: {exc}")
+        return errors
 
     async def capture_images(self, serial: str) -> dict:
         async with self._capture_lock:
@@ -148,9 +212,34 @@ class WorkshopCache:
             return self.status()
 
     async def capture_all(self, serial: str) -> dict:
-        await self.capture_arduino_data(serial)
-        await self.capture_app_runtime(serial)
-        return await self.capture_images(serial)
+        async with self._capture_all_lock:
+            paths = (
+                self.image_archive,
+                self.arduino_archive,
+                self.app_runtime_archive,
+                self.manifest_path,
+            )
+            backups: dict[Path, Path] = {}
+            for path in paths:
+                backup = path.with_name(path.name + ".backup")
+                backup.unlink(missing_ok=True)
+                if path.exists():
+                    path.replace(backup)
+                    backups[path] = backup
+            try:
+                await self.capture_arduino_data(serial)
+                await self.capture_app_runtime(serial)
+                result = await self.capture_images(serial)
+            except BaseException:
+                for path in paths:
+                    path.unlink(missing_ok=True)
+                for path, backup in backups.items():
+                    backup.replace(path)
+                raise
+            else:
+                for backup in backups.values():
+                    backup.unlink(missing_ok=True)
+                return result
 
     async def capture_app_runtime(self, serial: str) -> dict:
         async with self._capture_lock:

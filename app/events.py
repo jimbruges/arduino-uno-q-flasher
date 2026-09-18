@@ -140,7 +140,6 @@ class StartRunRequest(BaseModel):
     post_update_cmd: str | None = None
     prune_docker_before_post_update: bool = False
     use_package_cache: bool = True
-    max_parallel_updates: int = Field(default=4, ge=1, le=16)
     warm_cache: bool = False
     prepare_uploaded_app: bool = False
     example_apps: list[str] = Field(default_factory=list, max_length=200)

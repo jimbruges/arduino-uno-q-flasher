@@ -145,6 +145,45 @@ run_and_log() {
     return ${PIPESTATUS[0]}
 }
 
+sync_clock_from_host() {
+    local board_epoch skew
+
+    if ! [[ "${UNOQ_HOST_EPOCH:-}" =~ ^[0-9]{10,}$ ]]; then
+        add_error "Host time was not provided; refusing package verification with an unknown clock."
+        return 1
+    fi
+
+    board_epoch=$(date +%s 2>/dev/null || echo 0)
+    skew=$((board_epoch - UNOQ_HOST_EPOCH))
+    [ "$skew" -ge 0 ] || skew=$((-skew))
+    if [ "$skew" -le 30 ]; then
+        log "System clock is already aligned with the host ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))."
+    else
+        log "Correcting system clock from host time (board was ${skew}s out)..."
+        if ! run_sudo_cmd "date -u -s '@$UNOQ_HOST_EPOCH' >/dev/null"; then
+            add_error "Could not set the board clock; APT signatures cannot be verified safely."
+            return 1
+        fi
+        log "System clock corrected to $(date -u '+%Y-%m-%dT%H:%M:%SZ')."
+    fi
+
+    # Keep the clock accurate after WiFi becomes available. Setting the host
+    # epoch above is the authoritative bootstrap and does not depend on NTP.
+    run_sudo_cmd "timedatectl set-ntp true" >/dev/null 2>&1 || true
+
+    board_epoch=$(date +%s 2>/dev/null || echo 0)
+    skew=$((board_epoch - UNOQ_HOST_EPOCH))
+    [ "$skew" -ge 0 ] || skew=$((-skew))
+    if [ "$skew" -gt 30 ]; then
+        add_error "Board clock is still ${skew}s away from host time after synchronization."
+        return 1
+    fi
+}
+
+if ! sync_clock_from_host; then
+    exit 1
+fi
+
 configure_apt_cache() {
     if [ -z "${UNOQ_APT_CACHE_URL:-}" ]; then
         log "No package cache configured; using repositories directly."
@@ -196,6 +235,49 @@ ensure_app_lab_daemon() {
         sleep 1
     done
     log "App Lab daemon is ready (CLI ${cli_version:-unknown})."
+}
+
+wait_for_app_cli_internet() {
+    local count=0 max_wait=60
+    log "Checking direct internet connectivity for Arduino App CLI..."
+    until curl -fsS --max-time 5 --head https://downloads.arduino.cc >/dev/null 2>&1; do
+        count=$((count + 1))
+        if [ "$count" -ge "$max_wait" ]; then
+            add_error "Direct internet connectivity timeout before Arduino App CLI update"
+            return 1
+        fi
+        log "Arduino services not reachable yet, retrying... (${count}/${max_wait})"
+        sleep 1
+    done
+    log "Direct internet connectivity for Arduino App CLI confirmed."
+}
+
+run_app_cli_system_update() {
+    local attempt=1 max_attempts=3 output_file="/tmp/unoq-app-cli-update.log" status
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        : > "$output_file"
+        timeout "$UPDATE_TIMEOUT_SECONDS" arduino-app-cli system update --yes --only-arduino \
+            2>&1 | tee "$output_file"
+        status=${PIPESTATUS[0]}
+        if [ "$status" -eq 0 ]; then
+            rm -f "$output_file"
+            return 0
+        fi
+        if ! grep -Fq "no internet connection available" "$output_file" \
+            || [ "$attempt" -ge "$max_attempts" ]; then
+            rm -f "$output_file"
+            return "$status"
+        fi
+
+        attempt=$((attempt + 1))
+        log "Arduino App CLI connectivity check failed; retrying update (${attempt}/${max_attempts})..."
+        if ! wait_for_app_cli_internet; then
+            rm -f "$output_file"
+            return 1
+        fi
+        sleep 2
+    done
 }
 
 cleanup_before_updates() {
@@ -486,7 +568,9 @@ if echo "$ALSA_VERSION" | grep -qE '^1\.2\.14-1$'; then
     fi
 
     log "Remediation complete. Running Arduino-only system update..."
-    if ! arduino-app-cli system update --yes --only-arduino; then
+    if ! wait_for_app_cli_internet; then
+        exit 1
+    elif ! run_app_cli_system_update; then
         add_error "arduino-app-cli system update (remediation) failed"
     else
         SYSTEM_UPDATE_COMPLETED=1
@@ -501,7 +585,9 @@ if [ "$SYSTEM_UPDATE_COMPLETED" -eq 1 ]; then
     log "Arduino system update already completed during remediation; skipping duplicate pass."
 else
     log "Running arduino-app-cli system update..."
-    if ! timeout "$UPDATE_TIMEOUT_SECONDS" arduino-app-cli system update --yes --only-arduino; then
+    if ! wait_for_app_cli_internet; then
+        exit 1
+    elif ! run_app_cli_system_update; then
        add_error "arduino-app-cli system update failed"
     fi
 fi

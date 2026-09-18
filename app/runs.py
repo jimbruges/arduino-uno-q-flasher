@@ -9,7 +9,9 @@ Each run has:
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,15 +66,48 @@ class Registry:
     def register_upload(self, upload_id: str, folder: Path, name: str) -> Upload:
         upload = Upload(upload_id=upload_id, folder=folder, name=name)
         self._uploads[upload_id] = upload
+        metadata = {
+            "upload_id": upload_id,
+            "folder_name": name,
+            "folder": folder.name,
+        }
+        (folder.parent / "upload.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return upload
 
     def get_upload(self, upload_id: str) -> Upload | None:
-        return self._uploads.get(upload_id)
+        if not upload_id.isalnum() or len(upload_id) > 64:
+            return None
+        base = self.uploads_dir / upload_id
+        metadata_path = base / "upload.json"
+        try:
+            if time.time() - metadata_path.stat().st_mtime > 24 * 60 * 60:
+                self.cleanup_upload(upload_id)
+                return None
+        except OSError:
+            return None
+        upload = self._uploads.get(upload_id)
+        if upload is not None and upload.folder.is_dir():
+            return upload
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            folder = base / metadata["folder"]
+            name = str(metadata["folder_name"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if not folder.is_dir() or folder.parent != base:
+            return None
+        upload = Upload(upload_id=upload_id, folder=folder, name=name)
+        self._uploads[upload_id] = upload
+        return upload
 
     def cleanup_upload(self, upload_id: str) -> None:
         upload = self._uploads.pop(upload_id, None)
-        if upload and upload.folder.exists():
-            shutil.rmtree(upload.folder, ignore_errors=True)
+        target = upload.folder.parent if upload else self.uploads_dir / upload_id
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
 
     # ---------- runs ----------
 
@@ -193,11 +228,8 @@ class Registry:
 
         run.finished.set()
 
-        # Only auto-cleanup when every device succeeded. If any failed, keep
-        # the staged upload around so the user can hit Retry.
-        if not failed and run.upload is not None:
-            self.cleanup_upload(run.upload.upload_id)
-            run.upload = None
+        # Uploads remain reusable for 24 hours so browser reloads and later
+        # board batches do not require selecting and transferring the folder again.
 
     async def retry_device(
         self, run: Run, serial: str, skip: set[Stage]
