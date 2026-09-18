@@ -23,7 +23,7 @@ from .events import (
     Stage,
     StageEvent,
 )
-from .flasher import FlasherContext, flash_device
+from .flasher import AfterSuccessFn, FlasherContext, flash_device
 
 
 @dataclass
@@ -43,6 +43,7 @@ class Run:
     finished: asyncio.Event = field(default_factory=asyncio.Event)
     upload: Upload | None = None
     _tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    after_success: AfterSuccessFn | None = None
 
 
 class Registry:
@@ -134,8 +135,10 @@ class Registry:
         self,
         run: Run,
         device_configs: list[tuple[str, set[Stage]]],
+        after_success: AfterSuccessFn | None = None,
     ) -> None:
         """Kick off all devices in parallel and wait for completion."""
+        run.after_success = after_success
         for serial, skip in device_configs:
             run.devices[serial] = DeviceState(
                 serial=serial,
@@ -149,6 +152,7 @@ class Registry:
                 run.ctx,
                 skip,
                 lambda ev: self.emit(run, ev),
+                after_success,
             )
             return "success" if ok else "failed"
 
@@ -213,6 +217,7 @@ class Registry:
                 run.ctx,
                 skip,
                 lambda ev: self.emit(run, ev),
+                run.after_success,
             )
 
         t = asyncio.create_task(run_one())

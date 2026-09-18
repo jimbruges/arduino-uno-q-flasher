@@ -126,11 +126,8 @@
                     <textarea
                         id="post-update-cmd"
                         rows="5"
-                        placeholder="leave empty to skip"
-                    >arduino-app-cli app start user:workshop-racing-telemetry-unoq
-arduino-app-cli app stop user:workshop-racing-telemetry-unoq
-arduino-app-cli app start examples:inspirational/real-time-accelerometer
-arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textarea>
+                        placeholder="optional commands"
+                    ></textarea>
                 </label>
             </div>
         </div>
@@ -147,6 +144,26 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
             </div>
             <div class="step-body">
                 <div class="run-mode" role="group" aria-label="Steps to run">
+                    <label class="run-mode-option cache-mode-option">
+                        <input type="checkbox" id="run-use-package-cache" checked />
+                        <span class="run-mode-label">
+                            <span class="run-mode-title">Use USB package cache</span>
+                            <span class="run-mode-desc" id="package-cache-status">Cache status loading...</span>
+                            <span class="run-mode-desc" id="workshop-cache-status">No image bundle captured</span>
+                        </span>
+                    </label>
+                    <label class="run-mode-option">
+                        <span class="run-mode-label">
+                            <span class="run-mode-title">Parallel board updates</span>
+                            <select id="max-parallel-updates" aria-label="Maximum parallel board updates">
+                                <option value="1">1</option>
+                                <option value="2">2</option>
+                                <option value="4" selected>4</option>
+                                <option value="8">8</option>
+                                <option value="16">16</option>
+                            </select>
+                        </span>
+                    </label>
                     <label class="run-mode-option">
                         <input type="checkbox" id="run-step-wifi" checked />
                         <span class="run-mode-label">
@@ -155,17 +172,17 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
                         </span>
                     </label>
                     <label class="run-mode-option">
-                        <input type="checkbox" id="run-step-app" checked />
+                        <input type="checkbox" id="run-step-properties" checked />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 2: Push app folder + properties</span>
-                            <span class="run-mode-desc">Requires a selected upload folder unless Step 2 card is skipped.</span>
+                            <span class="run-mode-title">Step 2: Push properties.msgpack</span>
+                            <span class="run-mode-desc">Copies the selected folder's file, or the project default, independently.</span>
                         </span>
                     </label>
                     <label class="run-mode-option">
                         <input type="checkbox" id="run-step-setup" checked />
                         <span class="run-mode-label">
                             <span class="run-mode-title">Step 3: Run setup script</span>
-                            <span class="run-mode-desc">Includes WiFi validation + arduino-app-cli system update.</span>
+                            <span class="run-mode-desc">Includes WiFi validation, cached package downloads, and App Lab update.</span>
                         </span>
                     </label>
                     <label class="run-mode-option">
@@ -176,10 +193,43 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
                         </span>
                     </label>
                     <label class="run-mode-option">
-                        <input type="checkbox" id="run-step-post-update" checked />
+                        <input type="checkbox" id="run-step-app" checked />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 5: Run post-update command</span>
-                            <span class="run-mode-desc">Uses the command configured in Step 2.</span>
+                            <span class="run-mode-title">Step 5: Push app folder</span>
+                            <span class="run-mode-desc">Copies the selected app folder to each board.</span>
+                        </span>
+                    </label>
+                    <label class="run-mode-option">
+                        <input type="checkbox" id="run-step-warm-app" />
+                        <span class="run-mode-label">
+                            <span class="run-mode-title">Step 6: Prepare uploaded app on cache board</span>
+                            <span class="run-mode-desc">Warm cache only: starts and stops the uploaded app, then captures its cache for other boards.</span>
+                        </span>
+                    </label>
+                    <div class="run-mode-option example-run-option">
+                        <span class="run-mode-label">
+                            <span class="run-mode-title">Step 7: Prepare examples on cache board</span>
+                            <span class="run-mode-desc">Used by Warm cache only; fleet runs restore the captured files instead.</span>
+                            <details class="example-picker" id="example-picker">
+                                <summary id="example-picker-summary">No examples selected</summary>
+                                <div class="example-picker-menu">
+                                    <input id="example-search" type="search" placeholder="Filter examples" />
+                                    <div class="example-picker-actions">
+                                        <button type="button" class="btn btn-small" id="select-inspirational-btn">Select inspirational</button>
+                                        <button type="button" class="btn btn-small" id="clear-examples-btn">Clear</button>
+                                    </div>
+                                    <div id="example-options" class="example-options">
+                                        <span class="muted">Connect a board to load examples.</span>
+                                    </div>
+                                </div>
+                            </details>
+                        </span>
+                    </div>
+                    <label class="run-mode-option">
+                        <input type="checkbox" id="run-step-post-update" />
+                        <span class="run-mode-label">
+                            <span class="run-mode-title">Step 8: Run post-update command</span>
+                            <span class="run-mode-desc">Uses the optional commands configured above.</span>
                         </span>
                     </label>
                 </div>
@@ -209,6 +259,8 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
                     <span class="wifi-badge" data-status="unknown" title="No WiFi check yet">WiFi ?</span>
                     <button class="btn btn-small identify-btn" title="Blink the red LED to find this board on the bench">Identify</button>
                     <button class="btn btn-small wifi-check-btn" title="Run quick WiFi and internet connectivity checks">WiFi Check</button>
+                    <button class="btn btn-small warm-cache-btn" title="Update only this board, prepare selected examples, then capture all reusable caches">Warm cache</button>
+                    <button class="btn btn-small capture-cache-btn" title="Save this prepared board's Docker images and Arduino toolchain to the Mac">Capture cache</button>
                     <button class="btn btn-small retry-btn" hidden>Retry</button>
                 </div>
             </div>
@@ -236,6 +288,6 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
         </div>
     </template>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=4"></script>
 </body>
 </html>

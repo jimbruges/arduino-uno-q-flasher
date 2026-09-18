@@ -12,7 +12,10 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,15 +35,21 @@ from pydantic import BaseModel
 
 from . import adb
 from .env_file import MANAGED_KEYS, read_env, write_env
-from .events import OPTIONAL_STAGES, Stage, StartRunRequest
+from .events import LogEvent, OPTIONAL_STAGES, Stage, StageEvent, StartRunRequest
 from .flasher import FlasherContext, SETUP_SCRIPT_NAME
+from .package_cache import PackageCache
 from .runs import Registry
+from .workshop_cache import WorkshopCache
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 UPLOADS_DIR = PROJECT_ROOT / ".uploads"
+CACHE_DIR = PROJECT_ROOT / ".cache" / "packages"
+WORKSHOP_CACHE_DIR = PROJECT_ROOT / ".cache" / "workshop"
 
 registry = Registry(uploads_dir=UPLOADS_DIR)
+package_cache = PackageCache(cache_dir=CACHE_DIR)
+workshop_cache = WorkshopCache(root=WORKSHOP_CACHE_DIR)
 
 
 @asynccontextmanager
@@ -50,7 +59,11 @@ async def lifespan(app: FastAPI):
     if env_path.exists():
         load_dotenv(env_path)
     _sweep_old_uploads(UPLOADS_DIR, max_age_hours=24)
-    yield
+    package_cache.start()
+    try:
+        yield
+    finally:
+        package_cache.stop()
 
 
 def _sweep_old_uploads(uploads_dir: Path, max_age_hours: int) -> None:
@@ -103,6 +116,8 @@ async def health() -> dict:
         "password_configured": bool(os.environ.get("UNOQ_DEFAULT_PASSWORD")),
         "wifi_ssid_configured": bool(os.environ.get("UNOQ_WIFI_SSID")),
         "wifi_password_configured": bool(os.environ.get("UNOQ_WIFI_PASSWORD")),
+        "package_cache": package_cache.status(),
+        "workshop_cache": workshop_cache.status(),
     }
 
 
@@ -158,6 +173,70 @@ async def devices() -> dict:
     except adb.AdbNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
     return {"devices": [{"serial": d.serial, "state": d.state} for d in ds]}
+
+
+@app.get("/api/devices/{serial}/examples")
+async def device_examples(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    rc, output = await adb.shell(serial, "arduino-app-cli app list --format json")
+    if rc != 0:
+        raise HTTPException(status_code=502, detail=output or "could not list examples")
+    try:
+        apps = json.loads(output).get("apps", [])
+        examples = []
+        for app_entry in apps:
+            if not app_entry.get("example"):
+                continue
+            encoded = str(app_entry.get("id", ""))
+            padding = "=" * (-len(encoded) % 4)
+            app_id = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            if not app_id.startswith("examples:"):
+                continue
+            examples.append(
+                {
+                    "id": app_id,
+                    "name": app_entry.get("name") or app_id,
+                    "description": app_entry.get("description") or "",
+                    "status": app_entry.get("status") or "unknown",
+                    "inspirational": app_id.startswith("examples:inspirational/"),
+                }
+            )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail=f"invalid App CLI response: {exc}") from exc
+    examples.sort(key=lambda item: (not item["inspirational"], item["name"].lower()))
+    return {"device": serial, "examples": examples}
+
+
+@app.get("/api/cache")
+async def cache_status() -> dict:
+    return {
+        "packages": package_cache.status(),
+        "workshop": workshop_cache.status(),
+    }
+
+
+@app.post("/api/cache/images/{serial}")
+async def capture_image_cache(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    try:
+        return await workshop_cache.capture_images(serial)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/cache/workshop/{serial}")
+async def capture_workshop_cache(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    try:
+        return await workshop_cache.capture_all(serial)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # Blink the red user LED ~5s to physically identify the board on a bench full
@@ -388,6 +467,23 @@ async def start_run(req: StartRunRequest) -> dict:
         app_folder = upload.folder
     if not req.devices:
         raise HTTPException(status_code=400, detail="no devices selected")
+    if req.warm_cache and len(req.devices) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="warm-cache mode requires exactly one device",
+        )
+    if req.prepare_uploaded_app and (not req.warm_cache or upload is None):
+        raise HTTPException(
+            status_code=400,
+            detail="uploaded app preparation requires warm-cache mode and an upload",
+        )
+    invalid_examples = [
+        app_id
+        for app_id in req.example_apps
+        if not re.fullmatch(r"examples:[A-Za-z0-9._/-]+", app_id)
+    ]
+    if invalid_examples:
+        raise HTTPException(status_code=400, detail="invalid example app ID")
 
     setup_script = PROJECT_ROOT / SETUP_SCRIPT_NAME
     if not setup_script.is_file():
@@ -405,15 +501,73 @@ async def start_run(req: StartRunRequest) -> dict:
         project_root=PROJECT_ROOT,
         post_update_cmd=(req.post_update_cmd or "").strip() or None,
         prune_docker_before_post_update=req.prune_docker_before_post_update,
+        use_package_cache=req.use_package_cache,
+        max_parallel_updates=req.max_parallel_updates,
+        prepare_uploaded_app=req.warm_cache and req.prepare_uploaded_app,
+        example_apps=req.example_apps if req.warm_cache else [],
     )
     run = registry.create_run(ctx, upload)
+    previous_images = set(workshop_cache.status().get("images", []))
+    previous_packages = package_cache.cached_urls()
 
     device_configs: list[tuple[str, set[Stage]]] = [
         (d.serial, {s for s in d.skip_stages if s in OPTIONAL_STAGES})
         for d in req.devices
     ]
 
-    asyncio.create_task(registry.run_devices(run, device_configs))
+    async def capture_after_success(serial: str, emit) -> tuple[bool, str | None]:
+        await emit(StageEvent(device=serial, stage="capture_cache", status="started"))
+        try:
+            result = await workshop_cache.capture_all(serial)
+        except RuntimeError as exc:
+            await emit(
+                LogEvent(
+                    device=serial,
+                    stage="capture_cache",
+                    line=f"Cache capture failed: {exc}",
+                    stream="stderr",
+                )
+            )
+            await emit(StageEvent(device=serial, stage="capture_cache", status="failed"))
+            return False, "Failed to capture the warmed board cache."
+
+        new_images = sorted(set(result.get("images", [])) - previous_images)
+        new_packages = sorted(package_cache.cached_urls() - previous_packages)
+        await emit(
+            LogEvent(
+                device=serial,
+                stage="capture_cache",
+                line=(
+                    f"Captured {len(result.get('images', []))} Docker images, "
+                    f"{result.get('arduino_archive_bytes', 0)} bytes of Arduino data, "
+                    f"and {result.get('app_runtime_archive_bytes', 0)} bytes of app caches."
+                ),
+            )
+        )
+        await emit(
+            LogEvent(
+                device=serial,
+                stage="capture_cache",
+                line=(
+                    f"New cache entries: {len(new_images)} Docker image(s), "
+                    f"{len(new_packages)} package URL(s)."
+                ),
+            )
+        )
+        for image in new_images:
+            await emit(LogEvent(device=serial, stage="capture_cache", line=f"New image: {image}"))
+        for url in new_packages:
+            await emit(LogEvent(device=serial, stage="capture_cache", line=f"New package: {url}"))
+        await emit(StageEvent(device=serial, stage="capture_cache", status="completed"))
+        return True, None
+
+    asyncio.create_task(
+        registry.run_devices(
+            run,
+            device_configs,
+            capture_after_success if req.warm_cache else None,
+        )
+    )
     return {"run_id": run.run_id}
 
 

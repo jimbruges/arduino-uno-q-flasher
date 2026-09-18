@@ -28,6 +28,7 @@ with live per-device logs and real-time status. Replaces the original
   ```
 - Optional **`properties.msgpack`** at the project root or inside the chosen
   app folder. If present, it is pushed to:
+   - `/var/lib/arduino-app-cli/properties.msgpack` (App Lab's active state)
   - `/home/arduino/.local/share/arduino-app-cli/properties.msgpack`
   - `/tmp/properties.msgpack`
 
@@ -102,6 +103,36 @@ board. The deployment does not start the LLM example.
 
 ## Workflow (per device)
 
+By default, package downloads are routed over USB through the Mac-hosted cache
+on port 3142. The app creates a separate `adb reverse` tunnel for every board,
+so no LAN routing or proxy configuration is required. Debian and Arduino APT
+artifacts are stored under `.cache/packages/`; concurrent requests for the same
+file are coalesced, and cached files remain available when the upstream is
+temporarily unavailable. Original board APT sources are restored after every
+run, including failures.
+
+After preparing the first board and starting/stopping the required workshop
+examples, use **Capture cache** on its device card. The app saves all tagged
+Docker images, Arduino toolchain, and prepared app runtime caches under
+`.cache/workshop/`. Future runs
+stream these archives directly into each board before App Lab initialization;
+the images are checked again after optional pruning and before post-update
+commands. This avoids registry and toolchain downloads without consuming space
+for temporary archives on the board.
+
+Post-update commands are disabled by default. Captured examples are ready to
+launch in App Lab without starting and stopping them on every target board.
+Use the example multi-select and **Warm cache** on one device to update that
+board, start and stop the selected examples, and then capture any new package
+downloads, Docker images, toolchain data, and per-example runtime caches. Later
+fleet runs restore those artifacts without starting and stopping the examples
+again.
+
+The app-folder and `properties.msgpack` pushes are separate run steps. Enable
+**Prepare uploaded app on cache board** to start and stop the uploaded app during
+a one-board warm-cache run; its generated `.cache` data is captured with the
+example caches and restored to subsequent boards.
+
 The web app has a 9-stage workflow. Any stage can be skipped by Step 3
 selection (or per-device skip toggles where applicable):
 
@@ -118,9 +149,11 @@ selection (or per-device skip toggles where applicable):
    then restore `model-bundles/` when present
 8. `prune_docker_images` — optional cleanup of unused Docker/Podman images and
    stopped containers before post-update (disabled by default)
-9. `post_update` — run configured post-update commands on the device, one line
-   at a time. Failures here are logged but do not mark the device as failed,
-   since the flash itself is already done.
+9. `restore_workshop_cache` — verify or restore captured Docker images
+10. `post_update` — run configured workshop preparation commands in order;
+   any failure marks the board failed
+11. `verify_ready` — require a responsive App Lab CLI/daemon, populated assets,
+   a working Docker daemon, sufficient free disk, and the bundled model
 
 ## ADB parallelism — how many boards can I flash at once?
 

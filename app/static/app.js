@@ -2,7 +2,6 @@
 // Single page; no build step.
 
 const STAGES = [
-    "push_app",
     "push_setup_script",
     "push_env",
     "chmod_script",
@@ -10,15 +9,17 @@ const STAGES = [
     "push_properties",
     "run_setup",
     "prune_docker_images",
+    "restore_workshop_cache",
+    "push_app",
+    "prepare_uploaded_app",
+    "prepare_examples",
     "post_update",
+    "verify_ready",
+    "capture_cache",
 ];
 
 // Stages skipped when "Skip Step 1" (WiFi creds) toggle is on.
 const SKIP_STEP_WIFI_STAGES = ["push_env", "change_password"];
-
-// Stages skipped when "Skip Step 2" (app folder) toggle is on. push_app is
-// also implicitly skipped because the request goes out with upload_id=null.
-const SKIP_STEP_FOLDER_STAGES = ["push_properties"];
 
 const DEVICE_POLL_MS = 5000;
 
@@ -32,6 +33,8 @@ const state = {
     wifiOk: false,
     skipStep1: false,
     skipStep2: false,
+    examples: [],
+    exampleSource: null,
 
     runFinalStatusText: null,
 };
@@ -63,14 +66,26 @@ function wireControls() {
     for (const id of [
         "#run-step-wifi",
         "#run-step-app",
+        "#run-step-properties",
         "#run-step-setup",
         "#run-step-prune",
+        "#run-step-warm-app",
         "#run-step-post-update",
+        "#run-use-package-cache",
     ]) {
         const el = $(id);
         if (el) el.addEventListener("change", updateStartButtons);
     }
     $("#post-update-cmd")?.addEventListener("input", updateStartButtons);
+    $("#example-search")?.addEventListener("input", renderExampleOptions);
+    $("#select-inspirational-btn")?.addEventListener("click", () => {
+        for (const example of state.examples) example.selected = example.inspirational;
+        renderExampleOptions();
+    });
+    $("#clear-examples-btn")?.addEventListener("click", () => {
+        for (const example of state.examples) example.selected = false;
+        renderExampleOptions();
+    });
     for (const btn of $$(".pw-toggle")) {
         btn.addEventListener("click", (e) => {
             e.preventDefault();
@@ -117,6 +132,8 @@ async function refreshHealth() {
             const pw = j.password_configured ? "device pw set" : "no device pw";
             el.textContent = `ADB ready · ${pw}`;
         }
+        renderPackageCacheStatus(j.package_cache);
+        renderWorkshopCacheStatus(j.workshop_cache);
         state.wifiOk = j.wifi_ssid_configured && j.wifi_password_configured;
         renderWifiStep(j);
         updateStartButtons();
@@ -125,6 +142,32 @@ async function refreshHealth() {
         el.className = "health bad";
         el.textContent = "backend unreachable";
     }
+}
+
+function renderPackageCacheStatus(cache) {
+    const el = $("#package-cache-status");
+    if (!el || !cache) return;
+    const size = formatBytes(cache.size_bytes || 0);
+    const served = formatBytes(cache.bytes_from_cache || 0);
+    el.textContent = cache.running
+        ? `${size} stored · ${cache.hits || 0} hits · ${served} served from Mac`
+        : "Package cache is not running";
+}
+
+function renderWorkshopCacheStatus(cache) {
+    const el = $("#workshop-cache-status");
+    if (!el || !cache) return;
+    if (!cache.images_ready) {
+        el.textContent = "No image bundle captured";
+        return;
+    }
+    const toolchain = cache.arduino_ready
+        ? ` + ${formatBytes(cache.arduino_archive_bytes)} toolchain`
+        : "";
+    const runtime = cache.app_runtime_ready
+        ? ` + ${formatBytes(cache.app_runtime_archive_bytes)} app cache`
+        : "";
+    el.textContent = `${cache.images.length} images · ${formatBytes(cache.image_archive_bytes)}${toolchain}${runtime} · source ${cache.source_device}`;
 }
 
 function renderWifiStep(health) {
@@ -263,6 +306,7 @@ async function refreshDevices() {
         const j = await r.json();
         state.devices = j.devices;
         renderDeviceGrid();
+        await refreshExamples();
         updateStartButtons();
     } catch (e) {
         updateRunStepState("error fetching devices");
@@ -290,6 +334,8 @@ function renderDeviceGrid() {
         const retryBtn = node.querySelector(".retry-btn");
         const identifyBtn = node.querySelector(".identify-btn");
         const wifiCheckBtn = node.querySelector(".wifi-check-btn");
+        const captureCacheBtn = node.querySelector(".capture-cache-btn");
+        const warmCacheBtn = node.querySelector(".warm-cache-btn");
         const wifiBadgeEl = node.querySelector(".wifi-badge");
         const elapsedEl = node.querySelector(".elapsed");
         const failureEl = node.querySelector(".failure-reason");
@@ -306,11 +352,15 @@ function renderDeviceGrid() {
         retryBtn.addEventListener("click", () => retryDevice(d.serial));
         identifyBtn.addEventListener("click", () => identifyDevice(d.serial));
         wifiCheckBtn.addEventListener("click", () => wifiCheckDevice(d.serial));
+        captureCacheBtn.addEventListener("click", () => captureImageCache(d.serial));
+        warmCacheBtn.addEventListener("click", () => startRun(d.serial, true));
 
         grid.appendChild(node);
         state.cards.set(d.serial, {
             card: node, badgeEl, progressEl, stageEl, logEl, retryBtn, identifyBtn,
             wifiCheckBtn, wifiBadgeEl, elapsedEl, failureEl, summaryEl, skipInputs, logFollowState,
+            captureCacheBtn,
+            warmCacheBtn,
         });
     }
 
@@ -322,6 +372,101 @@ function renderDeviceGrid() {
                 state.cards.delete(serial);
             }
         }
+    }
+}
+
+async function refreshExamples() {
+    const serial = state.devices[0]?.serial;
+    if (!serial) {
+        state.examples = [];
+        state.exampleSource = null;
+        renderExampleOptions();
+        return;
+    }
+    if (state.exampleSource === serial && state.examples.length > 0) return;
+    const selected = new Set(selectedExampleIds());
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(serial)}/examples`);
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+        state.examples = (result.examples || []).map((example) => ({
+            ...example,
+            selected: selected.has(example.id),
+        }));
+        state.exampleSource = serial;
+        renderExampleOptions();
+    } catch (error) {
+        $("#example-options").textContent = `Could not load examples: ${error}`;
+    }
+}
+
+function selectedExampleIds() {
+    return state.examples.filter((example) => example.selected).map((example) => example.id);
+}
+
+function renderExampleOptions() {
+    const container = $("#example-options");
+    if (!container) return;
+    const query = ($("#example-search")?.value || "").trim().toLowerCase();
+    container.innerHTML = "";
+    for (const example of state.examples) {
+        const haystack = `${example.name} ${example.id} ${example.description}`.toLowerCase();
+        if (query && !haystack.includes(query)) continue;
+        const label = document.createElement("label");
+        label.className = "example-option";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = example.selected;
+        input.addEventListener("change", () => {
+            example.selected = input.checked;
+            updateExampleSummary();
+            updateRunStepState();
+        });
+        const text = document.createElement("span");
+        text.textContent = `${example.name} · ${example.id}`;
+        label.append(input, text);
+        container.appendChild(label);
+    }
+    if (!container.children.length) {
+        const empty = document.createElement("span");
+        empty.className = "muted";
+        empty.textContent = state.examples.length ? "No matching examples." : "No examples available.";
+        container.appendChild(empty);
+    }
+    updateExampleSummary();
+    updateRunStepState();
+}
+
+function updateExampleSummary() {
+    const count = selectedExampleIds().length;
+    const summary = $("#example-picker-summary");
+    if (summary) summary.textContent = count ? `${count} example${count === 1 ? "" : "s"} selected` : "No examples selected";
+}
+
+async function captureImageCache(serial) {
+    const c = state.cards.get(serial);
+    if (!c) return;
+    const btn = c.captureCacheBtn;
+    btn.disabled = true;
+    btn.textContent = "Capturing...";
+    appendLog(serial, "Capturing all tagged Docker images to the Mac cache...", "info");
+    try {
+        const response = await fetch(`/api/cache/workshop/${encodeURIComponent(serial)}`, {
+            method: "POST",
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+        appendLog(
+            serial,
+            `Captured ${result.images.length} images, ${formatBytes(result.arduino_archive_bytes)} toolchain, and ${formatBytes(result.app_runtime_archive_bytes)} app cache.`,
+            "info",
+        );
+        renderWorkshopCacheStatus(result);
+    } catch (error) {
+        appendLog(serial, `image capture failed: ${error}`, "err");
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "Capture cache";
     }
 }
 
@@ -412,6 +557,7 @@ function updateStartButtons() {
     const idle = state.runId === null;
     const doWifi = !!$("#run-step-wifi")?.checked;
     const doApp = !!$("#run-step-app")?.checked;
+    const doProperties = !!$("#run-step-properties")?.checked;
     const doSetup = !!$("#run-step-setup")?.checked;
     const doPost = !!$("#run-step-post-update")?.checked;
     const doPrune = !!$("#run-step-prune")?.checked;
@@ -435,6 +581,7 @@ function updateStartButtons() {
         const selected = ["run setup"];
         if (doWifi && !state.skipStep1) selected.unshift("WiFi/password");
         if (doApp && !state.skipStep2) selected.unshift("app push");
+        if (doProperties) selected.push("properties");
         if (!doSetup) selected.splice(selected.indexOf("run setup"), 1);
         if (doPrune) selected.push("docker prune");
         if (doPost) selected.push("post-update");
@@ -475,7 +622,7 @@ function missingFor({
     if (!haveDevices) missing.push("connect at least one UNO Q");
     if (needsStep1Inputs && !step1ok) missing.push("configure WiFi or uncheck Step 1 in Run");
     if (needsStep2Inputs && !step2ok) missing.push("choose a folder or uncheck Step 2 in Run");
-    if (needsPostCommand && !postCmd) missing.push("set Post-update command or uncheck Step 5 in Run");
+    if (needsPostCommand && !postCmd) missing.push("set Post-update command or uncheck Step 8 in Run");
     return missing.length ? "Needed: " + missing.join("; ") : "";
 }
 
@@ -500,40 +647,57 @@ function updateRunStepState(override) {
     }
     const doWifi = !!$("#run-step-wifi")?.checked;
     const doApp = !!$("#run-step-app")?.checked;
+    const doProperties = !!$("#run-step-properties")?.checked;
     const doSetup = !!$("#run-step-setup")?.checked;
     const doPrune = !!$("#run-step-prune")?.checked;
+    const doWarmApp = !!$("#run-step-warm-app")?.checked;
     const doPost = !!$("#run-step-post-update")?.checked;
     const ready = (!doWifi || state.wifiOk || state.skipStep1);
     step.dataset.status = ready ? "ready" : "pending";
     const selected = [];
     if (doWifi && !state.skipStep1) selected.push("step 1");
-    if (doApp && !state.skipStep2) selected.push("step 2");
+    if (doProperties) selected.push("step 2");
     if (doSetup) selected.push("step 3");
     if (doPrune) selected.push("step 4");
-    if (doPost) selected.push("step 5");
+    if (doApp && !state.skipStep2) selected.push("step 5");
+    if (doWarmApp) selected.push("step 6 (warm only)");
+    if (selectedExampleIds().length) selected.push("step 7 (warm only)");
+    if (doPost) selected.push("step 8");
     if (selected.length === 0) selected.push("no-op");
     stateEl.textContent = `${n} board${n === 1 ? "" : "s"} · ${selected.join(", ")}`;
 }
 
 // ---------- runs ----------
 
-async function startRun() {
+async function startRun(targetSerial = null, warmCache = false) {
     if (state.devices.length === 0) return;
     state.runFinalStatusText = null;
 
     const doWifi = !!$("#run-step-wifi")?.checked;
     const doApp = !!$("#run-step-app")?.checked;
+    const doProperties = !!$("#run-step-properties")?.checked;
     const doSetup = !!$("#run-step-setup")?.checked;
     const doPostUpdate = !!$("#run-step-post-update")?.checked;
     const doPrune = !!$("#run-step-prune")?.checked;
+    const doWarmApp = !!$("#run-step-warm-app")?.checked;
+
+    if (warmCache && doWarmApp && !state.upload) {
+        $("#run-status").textContent = "Choose an app folder before preparing it on the cache board.";
+        return;
+    }
 
     const baseSkip = [];
     if (!doWifi || state.skipStep1) baseSkip.push(...SKIP_STEP_WIFI_STAGES);
-    if (!doApp || state.skipStep2) baseSkip.push("push_app", ...SKIP_STEP_FOLDER_STAGES);
+    if (!doApp || state.skipStep2) baseSkip.push("push_app");
+    if (!doProperties) baseSkip.push("push_properties");
     if (!doSetup) baseSkip.push("push_setup_script", "chmod_script", "run_setup");
+    if (!warmCache || !doWarmApp) baseSkip.push("prepare_uploaded_app");
     if (!doPostUpdate) baseSkip.push("post_update");
 
-    const devices = state.devices.map((d) => {
+    const targetDevices = targetSerial
+        ? state.devices.filter((device) => device.serial === targetSerial)
+        : state.devices;
+    const devices = targetDevices.map((d) => {
         const userSkip = collectSkip(d.serial);
         const skip = Array.from(new Set([...baseSkip, ...userSkip]));
         return { serial: d.serial, skip_stages: skip };
@@ -543,11 +707,17 @@ async function startRun() {
         ? (($("#post-update-cmd").value || "").trim())
         : "";
     const pruneDockerBeforePostUpdate = doPrune;
+    const usePackageCache = !!$("#run-use-package-cache")?.checked;
+    const maxParallelUpdates = Number.parseInt($("#max-parallel-updates")?.value || "4", 10);
 
-    // Only send upload when Step 2 is selected and not skipped.
-    const sendUpload = doApp && !state.skipStep2 && state.upload;
+    const sendUpload = state.upload && (
+        (doApp && !state.skipStep2)
+        || doProperties
+        || (warmCache && doWarmApp)
+    );
 
-    resetAllCards();
+    if (targetSerial) resetCard(targetSerial);
+    else resetAllCards();
 
     const r = await fetch("/api/runs", {
         method: "POST",
@@ -557,6 +727,11 @@ async function startRun() {
             devices,
             post_update_cmd: postUpdateCmd || null,
             prune_docker_before_post_update: pruneDockerBeforePostUpdate,
+            use_package_cache: usePackageCache,
+            max_parallel_updates: maxParallelUpdates,
+            warm_cache: warmCache,
+            prepare_uploaded_app: warmCache && doWarmApp,
+            example_apps: warmCache ? selectedExampleIds() : [],
         }),
     });
     if (!r.ok) {
@@ -566,7 +741,9 @@ async function startRun() {
     }
     const j = await r.json();
     state.runId = j.run_id;
-    $("#run-status").textContent = `Run ${j.run_id} in progress…`;
+    $("#run-status").textContent = warmCache
+        ? `Warming cache from ${targetSerial}…`
+        : `Run ${j.run_id} in progress…`;
     updateStartButtons();
     openWs(j.run_id);
 }

@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 Stage = Literal[
-    "push_app",
     "push_setup_script",
     "push_env",
     "chmod_script",
@@ -13,11 +12,16 @@ Stage = Literal[
     "push_properties",
     "run_setup",
     "prune_docker_images",
+    "restore_workshop_cache",
+    "push_app",
+    "prepare_uploaded_app",
+    "prepare_examples",
     "post_update",
+    "verify_ready",
+    "capture_cache",
 ]
 
 ALL_STAGES: tuple[Stage, ...] = (
-    "push_app",
     "push_setup_script",
     "push_env",
     "chmod_script",
@@ -25,7 +29,13 @@ ALL_STAGES: tuple[Stage, ...] = (
     "push_properties",
     "run_setup",
     "prune_docker_images",
+    "restore_workshop_cache",
+    "push_app",
+    "prepare_uploaded_app",
+    "prepare_examples",
     "post_update",
+    "verify_ready",
+    "capture_cache",
 )
 
 # Stages the user can toggle off from the UI.
@@ -39,7 +49,11 @@ OPTIONAL_STAGES: frozenset[Stage] = frozenset(
         "push_properties",
         "run_setup",
         "prune_docker_images",
+        "restore_workshop_cache",
+        "prepare_uploaded_app",
+        "prepare_examples",
         "post_update",
+        "verify_ready",
     }
 )
 
@@ -125,6 +139,11 @@ class StartRunRequest(BaseModel):
     devices: list[DeviceConfig]
     post_update_cmd: str | None = None
     prune_docker_before_post_update: bool = False
+    use_package_cache: bool = True
+    max_parallel_updates: int = Field(default=4, ge=1, le=16)
+    warm_cache: bool = False
+    prepare_uploaded_app: bool = False
+    example_apps: list[str] = Field(default_factory=list, max_length=200)
 
 
 class DeviceState(BaseModel):
