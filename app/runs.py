@@ -237,6 +237,14 @@ class Registry:
         """Re-run a single device using the same context."""
         if serial in run._tasks and not run._tasks[serial].done():
             return  # already running
+        retrying_finished_run = run.finished.is_set()
+        if retrying_finished_run:
+            run.finished.clear()
+            run.event_log = [
+                event
+                for event in run.event_log
+                if not isinstance(event, RunFinishedEvent)
+            ]
         run.devices[serial] = DeviceState(
             serial=serial,
             status="idle",
@@ -244,13 +252,22 @@ class Registry:
         )
 
         async def run_one() -> None:
-            await flash_device(
+            succeeded = await flash_device(
                 serial,
                 run.ctx,
                 skip,
                 lambda ev: self.emit(run, ev),
                 run.after_success,
             )
+            if retrying_finished_run:
+                await self.emit(
+                    run,
+                    RunFinishedEvent(
+                        successful=[serial] if succeeded else [],
+                        failed=[] if succeeded else [serial],
+                    ),
+                )
+                run.finished.set()
 
         t = asyncio.create_task(run_one())
         run._tasks[serial] = t

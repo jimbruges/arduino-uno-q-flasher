@@ -252,6 +252,8 @@ wait_for_app_cli_internet() {
     log "Direct internet connectivity for Arduino App CLI confirmed."
 }
 
+UPDATE_TIMEOUT_SECONDS="${UNOQ_UPDATE_TIMEOUT_SECONDS:-2700}"
+
 run_app_cli_system_update() {
     local attempt=1 max_attempts=3 output_file="/tmp/unoq-app-cli-update.log" status
 
@@ -580,7 +582,6 @@ else
 fi
 
 # ── System update ─────────────────────────────────────────────────────────────
-UPDATE_TIMEOUT_SECONDS="${UNOQ_UPDATE_TIMEOUT_SECONDS:-2700}"
 if [ "$SYSTEM_UPDATE_COMPLETED" -eq 1 ]; then
     log "Arduino system update already completed during remediation; skipping duplicate pass."
 else

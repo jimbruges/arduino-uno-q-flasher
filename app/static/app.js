@@ -1139,7 +1139,12 @@ async function retryDevice(serial) {
     if (!r.ok) {
         const j = await r.json().catch(() => ({}));
         appendLog(serial, `retry failed: ${j.detail || r.status}`, "err");
+        return;
     }
+    state.runId = runId;
+    state.runFinalStatusText = null;
+    updateStartButtons();
+    openWs(runId);
 }
 
 async function identifyDevice(serial) {
@@ -1243,6 +1248,11 @@ async function wifiCheckAllDevices() {
 // ---------- WebSocket ----------
 
 function openWs(runId) {
+    if (state.ws) {
+        state.ws.onclose = null;
+        state.ws.onerror = null;
+        state.ws.close();
+    }
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws/runs/${runId}`);
     state.ws = ws;
@@ -1252,6 +1262,8 @@ function openWs(runId) {
         handleEvent(ev);
     };
     ws.onclose = () => {
+        if (state.ws !== ws) return;
+        state.ws = null;
         if (state.runId !== null && !state.runFinalStatusText) {
             $("#run-status").textContent =
                 `run ${runId} disconnected before completion`; 
