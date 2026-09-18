@@ -12,7 +12,16 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import os
+import platform
+import re
+import shutil
+import sys
+import time
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,15 +41,36 @@ from pydantic import BaseModel
 
 from . import adb
 from .env_file import MANAGED_KEYS, read_env, write_env
-from .events import OPTIONAL_STAGES, Stage, StartRunRequest
+from .events import LogEvent, OPTIONAL_STAGES, Stage, StageEvent, StartRunRequest
 from .flasher import FlasherContext, SETUP_SCRIPT_NAME
+from .package_cache import PackageCache
 from .runs import Registry
+from .workshop_cache import WorkshopCache
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 UPLOADS_DIR = PROJECT_ROOT / ".uploads"
+CACHE_DIR = PROJECT_ROOT / ".cache" / "packages"
+WORKSHOP_CACHE_DIR = PROJECT_ROOT / ".cache" / "workshop"
+FLASH_IMAGE_CACHE_DIR = PROJECT_ROOT / ".cache" / "flasher-images"
 
 registry = Registry(uploads_dir=UPLOADS_DIR)
+package_cache = PackageCache(cache_dir=CACHE_DIR)
+workshop_cache = WorkshopCache(root=WORKSHOP_CACHE_DIR)
+flash_lock = asyncio.Lock()
+flash_state: dict = {
+    "status": "idle",
+    "logs": [],
+    "exit_code": None,
+    "preserve_user": False,
+}
+flash_task: asyncio.Task | None = None
+flash_process: asyncio.subprocess.Process | None = None
+LOCAL_FLASHER_PATH = PROJECT_ROOT / "tools" / "arduino-flasher-cli" / "arduino-flasher-cli"
+latest_image_cache: dict = {"checked_at": 0.0, "info": None, "error": None}
+image_digest_cache: dict = {"signature": None, "expected": None, "matches": False}
+MIN_FLASH_FREE_BYTES = 8 * 1024 * 1024 * 1024
+FLASH_PROCESS_TIMEOUT_SECONDS = 45 * 60
 
 
 @asynccontextmanager
@@ -50,7 +80,11 @@ async def lifespan(app: FastAPI):
     if env_path.exists():
         load_dotenv(env_path)
     _sweep_old_uploads(UPLOADS_DIR, max_age_hours=24)
-    yield
+    package_cache.start()
+    try:
+        yield
+    finally:
+        package_cache.stop()
 
 
 def _sweep_old_uploads(uploads_dir: Path, max_age_hours: int) -> None:
@@ -103,6 +137,10 @@ async def health() -> dict:
         "password_configured": bool(os.environ.get("UNOQ_DEFAULT_PASSWORD")),
         "wifi_ssid_configured": bool(os.environ.get("UNOQ_WIFI_SSID")),
         "wifi_password_configured": bool(os.environ.get("UNOQ_WIFI_PASSWORD")),
+        "setup_script_available": (PROJECT_ROOT / SETUP_SCRIPT_NAME).is_file(),
+        "properties_available": (PROJECT_ROOT / "properties.msgpack").is_file(),
+        "package_cache": package_cache.status(),
+        "workshop_cache": workshop_cache.status(),
     }
 
 
@@ -110,6 +148,315 @@ class SettingsBody(BaseModel):
     UNOQ_WIFI_SSID: str | None = None
     UNOQ_WIFI_PASSWORD: str | None = None
     UNOQ_DEFAULT_PASSWORD: str | None = None
+
+
+class FlashImageRequest(BaseModel):
+    edl_pins_confirmed: bool = False
+    preserve_user: bool = False
+
+
+class CopilotDiagnosisRequest(BaseModel):
+    prompt: str
+
+
+@app.post("/api/copilot/diagnose")
+async def diagnose_with_copilot(request: CopilotDiagnosisRequest) -> dict:
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="diagnostic prompt is empty")
+    if len(prompt) > 20_000:
+        raise HTTPException(status_code=400, detail="diagnostic prompt is too large")
+
+    code_cli = shutil.which("code")
+    if code_cli is None and sys.platform == "darwin":
+        bundled_cli = Path("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+        if bundled_cli.is_file():
+            code_cli = str(bundled_cli)
+    if code_cli is None:
+        raise HTTPException(status_code=503, detail="VS Code command-line tool was not found")
+
+    process = await asyncio.create_subprocess_exec(
+        code_cli,
+        "chat",
+        "--mode",
+        "agent",
+        "--reuse-window",
+        prompt,
+        cwd=PROJECT_ROOT,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise HTTPException(status_code=504, detail="VS Code did not accept the Copilot request")
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise HTTPException(status_code=503, detail=detail or "VS Code failed to open Copilot Chat")
+    return {"ok": True}
+
+
+def _flasher_path() -> str | None:
+    local_binary_matches_host = (
+        sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}
+    )
+    if (
+        local_binary_matches_host
+        and LOCAL_FLASHER_PATH.is_file()
+        and os.access(LOCAL_FLASHER_PATH, os.X_OK)
+    ):
+        return str(LOCAL_FLASHER_PATH)
+    return shutil.which("arduino-flasher-cli")
+
+
+async def _edl_device_count() -> int:
+    if sys.platform == "darwin":
+        command = ["system_profiler", "SPUSBDataType", "-json", "-detailLevel", "mini"]
+    elif sys.platform.startswith("linux"):
+        command = ["lsusb"]
+    else:
+        return 0
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+    except (OSError, asyncio.TimeoutError):
+        return 0
+    output = stdout.decode("utf-8", errors="replace")
+    if sys.platform == "darwin":
+        try:
+            usb_data = json.loads(output)
+        except json.JSONDecodeError:
+            return 0
+
+        def count_edl_devices(value: object) -> int:
+            if isinstance(value, dict):
+                vendor = str(value.get("vendor_id", "")).lower()
+                product = str(value.get("product_id", "")).lower()
+                own_match = int("0x05c6" in vendor and "0x9008" in product)
+                return own_match + sum(count_edl_devices(item) for item in value.values())
+            if isinstance(value, list):
+                return sum(count_edl_devices(item) for item in value)
+            return 0
+
+        return count_edl_devices(usb_data)
+    return sum("05c6:9008" in line.lower() for line in output.splitlines())
+
+
+async def _run_image_flash(preserve_user: bool) -> None:
+    tool = _flasher_path()
+    if tool is None:
+        flash_state.update(
+            status="failed",
+            logs=["Arduino Flasher CLI disappeared before flashing could start."],
+            exit_code=-1,
+        )
+        return
+    flash_state.update(status="running", logs=[], exit_code=None, preserve_user=preserve_user)
+    try:
+        image_info = await _latest_image_info(tool, force=True)
+        image_path = FLASH_IMAGE_CACHE_DIR / Path(urlparse(image_info["url"]).path).name
+        if not await _image_matches(image_path, image_info["sha256"]):
+            image_path.unlink(missing_ok=True)
+            FLASH_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            flash_state["logs"].append(
+                f"Downloading UNO Q image {image_info['version']} once for this Mac..."
+            )
+            exit_code = await asyncio.wait_for(
+                _stream_flasher(
+                    tool,
+                    "download",
+                    image_info["version"],
+                    "--dest-dir",
+                    str(FLASH_IMAGE_CACHE_DIR),
+                ),
+                timeout=FLASH_PROCESS_TIMEOUT_SECONDS,
+            )
+            if exit_code != 0 or not await _image_matches(image_path, image_info["sha256"]):
+                raise RuntimeError("latest image download or checksum verification failed")
+            for old_image in FLASH_IMAGE_CACHE_DIR.iterdir():
+                if old_image.is_file() and old_image != image_path:
+                    old_image.unlink(missing_ok=True)
+        else:
+            flash_state["logs"].append(
+                f"Using verified cached UNO Q image {image_info['version']}."
+            )
+
+        if await _edl_device_count() != 1:
+            raise RuntimeError("exactly one EDL board must remain connected")
+        command = [tool, "flash", str(image_path), "--yes"]
+        if preserve_user:
+            command.append("--preserve-user")
+        flash_state["logs"].append("Starting official Arduino Flasher CLI...")
+        exit_code = await asyncio.wait_for(
+            _stream_flasher(*command),
+            timeout=FLASH_PROCESS_TIMEOUT_SECONDS,
+        )
+        flash_state["exit_code"] = exit_code
+        flash_state["status"] = "succeeded" if exit_code == 0 else "failed"
+    except asyncio.CancelledError:
+        flash_state["logs"].append("Operation canceled by the operator.")
+        flash_state["status"] = "canceled"
+        flash_state["exit_code"] = -2
+        raise
+    except Exception as exc:  # noqa: BLE001
+        flash_state["logs"].append(f"Image operation failed: {exc}")
+        flash_state["status"] = "failed"
+        flash_state["exit_code"] = -1
+
+
+async def _stream_flasher(*command: str) -> int:
+    global flash_process
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    flash_process = process
+    try:
+        assert process.stdout is not None
+        while line := await process.stdout.readline():
+            flash_state["logs"].append(line.decode("utf-8", errors="replace").rstrip())
+            flash_state["logs"] = flash_state["logs"][-500:]
+        return await process.wait()
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        raise
+    finally:
+        flash_process = None
+
+
+async def _latest_image_info(tool: str, force: bool = False) -> dict:
+    age = time.monotonic() - latest_image_cache["checked_at"]
+    if not force and latest_image_cache["info"] and age < 300:
+        return latest_image_cache["info"]
+    process = await asyncio.create_subprocess_exec(
+        tool,
+        "list",
+        "--format",
+        "json",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+    if process.returncode != 0:
+        raise RuntimeError(stderr.decode("utf-8", errors="replace").strip() or "image catalog failed")
+    catalog = json.loads(stdout)
+    info = catalog["latest"]
+    if not all(info.get(key) for key in ("version", "url", "sha256")):
+        raise RuntimeError("latest image catalog entry is incomplete")
+    latest_image_cache.update(checked_at=time.monotonic(), info=info, error=None)
+    return info
+
+
+async def _image_matches(path: Path, expected_sha256: str) -> bool:
+    if not path.is_file():
+        return False
+    stat = path.stat()
+    signature = (str(path), stat.st_size, stat.st_mtime_ns)
+    if (
+        image_digest_cache["signature"] == signature
+        and image_digest_cache["expected"] == expected_sha256
+    ):
+        return image_digest_cache["matches"]
+
+    def digest() -> str:
+        result = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(4 * 1024 * 1024):
+                result.update(chunk)
+        return result.hexdigest()
+
+    matches = await asyncio.to_thread(digest) == expected_sha256
+    image_digest_cache.update(
+        signature=signature,
+        expected=expected_sha256,
+        matches=matches,
+    )
+    return matches
+
+
+@app.get("/api/flashing/status")
+async def flashing_status() -> dict:
+    image: dict = {"available": False, "cached": False}
+    tool = _flasher_path()
+    if tool is not None:
+        try:
+            info = await _latest_image_info(tool)
+            path = FLASH_IMAGE_CACHE_DIR / Path(urlparse(info["url"]).path).name
+            image = {
+                "available": True,
+                "cached": await _image_matches(path, info["sha256"]),
+                "version": info["version"],
+                "path": str(path),
+            }
+        except (OSError, ValueError, KeyError, asyncio.TimeoutError, RuntimeError) as exc:
+            image = {"available": False, "cached": False, "error": str(exc)}
+    return {
+        **flash_state,
+        "tool_available": _flasher_path() is not None,
+        "tool_path": _flasher_path(),
+        "edl_devices": await _edl_device_count(),
+        "platform_supported": sys.platform == "darwin" or sys.platform.startswith("linux"),
+        "image": image,
+        "image_cache_dir": str(FLASH_IMAGE_CACHE_DIR),
+        "free_bytes": shutil.disk_usage(PROJECT_ROOT).free,
+        "required_free_bytes": MIN_FLASH_FREE_BYTES,
+    }
+
+
+@app.post("/api/flashing/start")
+async def start_image_flash(request: FlashImageRequest) -> dict:
+    global flash_task
+    if not request.edl_pins_confirmed:
+        raise HTTPException(status_code=400, detail="confirm the EDL pins are bridged")
+    if _flasher_path() is None:
+        raise HTTPException(status_code=503, detail="arduino-flasher-cli is not available")
+    if shutil.disk_usage(PROJECT_ROOT).free < MIN_FLASH_FREE_BYTES:
+        raise HTTPException(
+            status_code=507,
+            detail="at least 8 GB of free space is required to download and extract the image",
+        )
+    async with flash_lock:
+        if flash_state["status"] in {"starting", "running"}:
+            raise HTTPException(status_code=409, detail="an image flash is already running")
+        edl_devices = await _edl_device_count()
+        if edl_devices != 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"connect exactly one board in EDL mode; detected {edl_devices}",
+            )
+        flash_task = asyncio.create_task(_run_image_flash(request.preserve_user))
+        flash_state.update(
+            status="starting",
+            logs=["Validated one EDL board; starting flasher..."],
+            exit_code=None,
+            preserve_user=request.preserve_user,
+        )
+    return {"ok": True}
+
+
+@app.post("/api/flashing/cancel")
+async def cancel_image_flash() -> dict:
+    if flash_task is None or flash_task.done():
+        raise HTTPException(status_code=409, detail="no image operation is running")
+    flash_task.cancel()
+    try:
+        await flash_task
+    except asyncio.CancelledError:
+        pass
+    return {"ok": True, "status": flash_state["status"]}
 
 
 @app.get("/api/settings")
@@ -158,6 +505,75 @@ async def devices() -> dict:
     except adb.AdbNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
     return {"devices": [{"serial": d.serial, "state": d.state} for d in ds]}
+
+
+@app.get("/api/devices/{serial}/examples")
+async def device_examples(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    rc, output = await adb.shell(serial, "arduino-app-cli app list --format json")
+    if rc != 0:
+        raise HTTPException(status_code=502, detail=output or "could not list examples")
+    try:
+        apps = json.loads(output).get("apps", [])
+        examples = []
+        for app_entry in apps:
+            if not app_entry.get("example"):
+                continue
+            encoded = str(app_entry.get("id", ""))
+            padding = "=" * (-len(encoded) % 4)
+            app_id = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            if not app_id.startswith("examples:"):
+                continue
+            examples.append(
+                {
+                    "id": app_id,
+                    "name": app_entry.get("name") or app_id,
+                    "description": app_entry.get("description") or "",
+                    "status": app_entry.get("status") or "unknown",
+                    "inspirational": app_id.startswith("examples:inspirational/"),
+                }
+            )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail=f"invalid App CLI response: {exc}") from exc
+    examples.sort(key=lambda item: (not item["inspirational"], item["name"].lower()))
+    return {"device": serial, "examples": examples}
+
+
+@app.get("/api/cache")
+async def cache_status() -> dict:
+    return {
+        "packages": package_cache.status(),
+        "workshop": workshop_cache.status(),
+    }
+
+
+@app.post("/api/cache/verify")
+async def verify_cache() -> dict:
+    return await workshop_cache.verify()
+
+
+@app.post("/api/cache/images/{serial}")
+async def capture_image_cache(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    try:
+        return await workshop_cache.capture_images(serial)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/cache/workshop/{serial}")
+async def capture_workshop_cache(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    try:
+        return await workshop_cache.capture_all(serial)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # Blink the red user LED ~5s to physically identify the board on a bench full
@@ -374,6 +790,30 @@ async def upload(
         "folder_name": folder_name,
         "file_count": file_count,
         "eim_files": eim_files,
+        "properties_available": (folder_root / "properties.msgpack").is_file(),
+    }
+
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload(upload_id: str) -> dict:
+    upload = registry.get_upload(upload_id)
+    if upload is None:
+        raise HTTPException(status_code=404, detail="staged app folder expired or is unavailable")
+    files = [path for path in upload.folder.rglob("*") if path.is_file()]
+    eim_files = [
+        {
+            "path": path.relative_to(upload.folder).as_posix(),
+            "size_bytes": path.stat().st_size,
+        }
+        for path in files
+        if path.suffix.lower() == ".eim"
+    ]
+    return {
+        "upload_id": upload.upload_id,
+        "folder_name": upload.name,
+        "file_count": len(files),
+        "eim_files": sorted(eim_files, key=lambda item: item["path"]),
+        "properties_available": (upload.folder / "properties.msgpack").is_file(),
     }
 
 
@@ -388,9 +828,57 @@ async def start_run(req: StartRunRequest) -> dict:
         app_folder = upload.folder
     if not req.devices:
         raise HTTPException(status_code=400, detail="no devices selected")
+    if req.warm_cache and len(req.devices) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="warm-cache mode requires exactly one device",
+        )
+    if req.prepare_uploaded_app and (not req.warm_cache or upload is None):
+        raise HTTPException(
+            status_code=400,
+            detail="uploaded app preparation requires warm-cache mode and an upload",
+        )
+    invalid_examples = [
+        app_id
+        for app_id in req.example_apps
+        if not re.fullmatch(r"examples:[A-Za-z0-9._/-]+", app_id)
+    ]
+    if invalid_examples:
+        raise HTTPException(status_code=400, detail="invalid example app ID")
+
+    app_push_requested = any("push_app" not in device.skip_stages for device in req.devices)
+    if app_push_requested and upload is None:
+        raise HTTPException(status_code=400, detail="app-folder push requires a staged folder")
+    post_update_requested = any(
+        "post_update" not in device.skip_stages for device in req.devices
+    )
+    if post_update_requested and not (req.post_update_cmd or "").strip():
+        raise HTTPException(status_code=400, detail="post-update stage requires a command")
+    properties_requested = any(
+        "push_properties" not in device.skip_stages for device in req.devices
+    )
+    properties_available = (PROJECT_ROOT / "properties.msgpack").is_file() or (
+        app_folder is not None and (app_folder / "properties.msgpack").is_file()
+    )
+    if properties_requested and not properties_available:
+        raise HTTPException(status_code=400, detail="properties.msgpack is required but missing")
+
+    cache = await workshop_cache.verify()
+    workshop_restore_requested = any(
+        "restore_workshop_cache" not in device.skip_stages for device in req.devices
+    )
+    if workshop_restore_requested and cache["integrity"] == "invalid":
+        raise HTTPException(
+            status_code=409,
+            detail="Saved workshop files are damaged; warm the cache again before setup.",
+        )
 
     setup_script = PROJECT_ROOT / SETUP_SCRIPT_NAME
-    if not setup_script.is_file():
+    setup_script_requested = any(
+        not {"push_setup_script", "chmod_script", "run_setup"}.issubset(device.skip_stages)
+        for device in req.devices
+    )
+    if setup_script_requested and not setup_script.is_file():
         raise HTTPException(
             status_code=500,
             detail=f"{SETUP_SCRIPT_NAME} not found at project root: {setup_script}",
@@ -405,15 +893,73 @@ async def start_run(req: StartRunRequest) -> dict:
         project_root=PROJECT_ROOT,
         post_update_cmd=(req.post_update_cmd or "").strip() or None,
         prune_docker_before_post_update=req.prune_docker_before_post_update,
+        use_package_cache=req.use_package_cache,
+        max_parallel_updates=len(req.devices),
+        prepare_uploaded_app=req.warm_cache and req.prepare_uploaded_app,
+        example_apps=req.example_apps if req.warm_cache else [],
     )
     run = registry.create_run(ctx, upload)
+    previous_images = set(workshop_cache.status().get("images", []))
+    previous_packages = package_cache.cached_urls()
 
     device_configs: list[tuple[str, set[Stage]]] = [
         (d.serial, {s for s in d.skip_stages if s in OPTIONAL_STAGES})
         for d in req.devices
     ]
 
-    asyncio.create_task(registry.run_devices(run, device_configs))
+    async def capture_after_success(serial: str, emit) -> tuple[bool, str | None]:
+        await emit(StageEvent(device=serial, stage="capture_cache", status="started"))
+        try:
+            result = await workshop_cache.capture_all(serial)
+        except RuntimeError as exc:
+            await emit(
+                LogEvent(
+                    device=serial,
+                    stage="capture_cache",
+                    line=f"Cache capture failed: {exc}",
+                    stream="stderr",
+                )
+            )
+            await emit(StageEvent(device=serial, stage="capture_cache", status="failed"))
+            return False, "Failed to capture the warmed board cache."
+
+        new_images = sorted(set(result.get("images", [])) - previous_images)
+        new_packages = sorted(package_cache.cached_urls() - previous_packages)
+        await emit(
+            LogEvent(
+                device=serial,
+                stage="capture_cache",
+                line=(
+                    f"Captured {len(result.get('images', []))} Docker images, "
+                    f"{result.get('arduino_archive_bytes', 0)} bytes of Arduino data, "
+                    f"and {result.get('app_runtime_archive_bytes', 0)} bytes of app caches."
+                ),
+            )
+        )
+        await emit(
+            LogEvent(
+                device=serial,
+                stage="capture_cache",
+                line=(
+                    f"New cache entries: {len(new_images)} Docker image(s), "
+                    f"{len(new_packages)} package URL(s)."
+                ),
+            )
+        )
+        for image in new_images:
+            await emit(LogEvent(device=serial, stage="capture_cache", line=f"New image: {image}"))
+        for url in new_packages:
+            await emit(LogEvent(device=serial, stage="capture_cache", line=f"New package: {url}"))
+        await emit(StageEvent(device=serial, stage="capture_cache", status="completed"))
+        return True, None
+
+    asyncio.create_task(
+        registry.run_devices(
+            run,
+            device_configs,
+            capture_after_success if req.warm_cache else None,
+        )
+    )
     return {"run_id": run.run_id}
 
 

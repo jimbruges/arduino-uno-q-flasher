@@ -9,7 +9,9 @@ Each run has:
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +25,7 @@ from .events import (
     Stage,
     StageEvent,
 )
-from .flasher import FlasherContext, flash_device
+from .flasher import AfterSuccessFn, FlasherContext, flash_device
 
 
 @dataclass
@@ -43,6 +45,7 @@ class Run:
     finished: asyncio.Event = field(default_factory=asyncio.Event)
     upload: Upload | None = None
     _tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    after_success: AfterSuccessFn | None = None
 
 
 class Registry:
@@ -63,15 +66,48 @@ class Registry:
     def register_upload(self, upload_id: str, folder: Path, name: str) -> Upload:
         upload = Upload(upload_id=upload_id, folder=folder, name=name)
         self._uploads[upload_id] = upload
+        metadata = {
+            "upload_id": upload_id,
+            "folder_name": name,
+            "folder": folder.name,
+        }
+        (folder.parent / "upload.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return upload
 
     def get_upload(self, upload_id: str) -> Upload | None:
-        return self._uploads.get(upload_id)
+        if not upload_id.isalnum() or len(upload_id) > 64:
+            return None
+        base = self.uploads_dir / upload_id
+        metadata_path = base / "upload.json"
+        try:
+            if time.time() - metadata_path.stat().st_mtime > 24 * 60 * 60:
+                self.cleanup_upload(upload_id)
+                return None
+        except OSError:
+            return None
+        upload = self._uploads.get(upload_id)
+        if upload is not None and upload.folder.is_dir():
+            return upload
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            folder = base / metadata["folder"]
+            name = str(metadata["folder_name"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if not folder.is_dir() or folder.parent != base:
+            return None
+        upload = Upload(upload_id=upload_id, folder=folder, name=name)
+        self._uploads[upload_id] = upload
+        return upload
 
     def cleanup_upload(self, upload_id: str) -> None:
         upload = self._uploads.pop(upload_id, None)
-        if upload and upload.folder.exists():
-            shutil.rmtree(upload.folder, ignore_errors=True)
+        target = upload.folder.parent if upload else self.uploads_dir / upload_id
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
 
     # ---------- runs ----------
 
@@ -134,8 +170,10 @@ class Registry:
         self,
         run: Run,
         device_configs: list[tuple[str, set[Stage]]],
+        after_success: AfterSuccessFn | None = None,
     ) -> None:
         """Kick off all devices in parallel and wait for completion."""
+        run.after_success = after_success
         for serial, skip in device_configs:
             run.devices[serial] = DeviceState(
                 serial=serial,
@@ -149,6 +187,7 @@ class Registry:
                 run.ctx,
                 skip,
                 lambda ev: self.emit(run, ev),
+                after_success,
             )
             return "success" if ok else "failed"
 
@@ -189,11 +228,8 @@ class Registry:
 
         run.finished.set()
 
-        # Only auto-cleanup when every device succeeded. If any failed, keep
-        # the staged upload around so the user can hit Retry.
-        if not failed and run.upload is not None:
-            self.cleanup_upload(run.upload.upload_id)
-            run.upload = None
+        # Uploads remain reusable for 24 hours so browser reloads and later
+        # board batches do not require selecting and transferring the folder again.
 
     async def retry_device(
         self, run: Run, serial: str, skip: set[Stage]
@@ -201,6 +237,14 @@ class Registry:
         """Re-run a single device using the same context."""
         if serial in run._tasks and not run._tasks[serial].done():
             return  # already running
+        retrying_finished_run = run.finished.is_set()
+        if retrying_finished_run:
+            run.finished.clear()
+            run.event_log = [
+                event
+                for event in run.event_log
+                if not isinstance(event, RunFinishedEvent)
+            ]
         run.devices[serial] = DeviceState(
             serial=serial,
             status="idle",
@@ -208,12 +252,22 @@ class Registry:
         )
 
         async def run_one() -> None:
-            await flash_device(
+            succeeded = await flash_device(
                 serial,
                 run.ctx,
                 skip,
                 lambda ev: self.emit(run, ev),
+                run.after_success,
             )
+            if retrying_finished_run:
+                await self.emit(
+                    run,
+                    RunFinishedEvent(
+                        successful=[serial] if succeeded else [],
+                        failed=[] if succeeded else [serial],
+                    ),
+                )
+                run.finished.set()
 
         t = asyncio.create_task(run_one())
         run._tasks[serial] = t

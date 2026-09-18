@@ -110,3 +110,86 @@ async def shell(
     return await _run_streaming(
         ["-s", serial, "shell", command], on_line
     )
+
+
+async def reverse(
+    serial: str,
+    remote: str,
+    local: str,
+    on_line: LineCallback | None = None,
+) -> tuple[int, str]:
+    return await _run_streaming(
+        ["-s", serial, "reverse", remote, local], on_line
+    )
+
+
+async def remove_reverse(
+    serial: str,
+    remote: str,
+    on_line: LineCallback | None = None,
+) -> tuple[int, str]:
+    return await _run_streaming(
+        ["-s", serial, "reverse", "--remove", remote], on_line
+    )
+
+
+async def exec_out_to_file(
+    serial: str,
+    remote_args: list[str],
+    target: Path,
+    validate: Callable[[Path], None] | None = None,
+) -> tuple[int, str]:
+    """Stream binary stdout from `adb exec-out` into a local file."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(target.suffix + ".part")
+    with temp.open("wb") as output:
+        proc = await asyncio.create_subprocess_exec(
+            adb_path(),
+            "-s",
+            serial,
+            "exec-out",
+            *remote_args,
+            stdout=output,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_b = await proc.communicate()
+    stderr = stderr_b.decode(errors="replace").strip()
+    if proc.returncode != 0:
+        temp.unlink(missing_ok=True)
+        return proc.returncode, stderr
+    try:
+        if validate is not None:
+            validate(temp)
+        temp.replace(target)
+    except (OSError, ValueError) as exc:
+        temp.unlink(missing_ok=True)
+        return 1, str(exc)
+    return 0, stderr
+
+
+async def stream_file_to_shell(
+    serial: str,
+    source: Path,
+    command: str,
+    on_line: LineCallback | None = None,
+) -> tuple[int, str]:
+    """Stream a local binary file to a remote command's stdin."""
+    with source.open("rb") as input_file:
+        proc = await asyncio.create_subprocess_exec(
+            adb_path(),
+            "-s",
+            serial,
+            "shell",
+            command,
+            stdin=input_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await proc.communicate()
+    output: list[str] = []
+    for label, data in (("stdout", stdout_b), ("stderr", stderr_b)):
+        for line in data.decode(errors="replace").splitlines():
+            output.append(line)
+            if on_line is not None:
+                await on_line(line, label)
+    return proc.returncode, "\n".join(output)

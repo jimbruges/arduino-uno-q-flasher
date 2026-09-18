@@ -31,9 +31,10 @@
             </div>
             <div class="step-body">
                 <label class="step-skip">
-                    <input type="checkbox" id="skip-step-wifi" />
-                    <span>Skip — keep existing WiFi & device password on board</span>
+                    <input type="checkbox" id="run-step-wifi" checked />
+                    <span>Configure WiFi and device password on every board</span>
                 </label>
+                <span class="muted">Off: skip WiFi setup and keep each board's existing credentials.</span>
                 <div id="wifi-settings-form" class="inline-settings">
                     <div class="inline-setting">
                         <label for="setting-ssid">WiFi SSID</label>
@@ -64,7 +65,7 @@
                         </div>
                     </div>
                     <div class="inline-setting">
-                        <label for="setting-device-pw">Default device password <em>(optional)</em></label>
+                        <label for="setting-device-pw">Device SSH password <em>(recommended for remote access)</em></label>
                         <div class="pw-field">
                             <input type="password" id="setting-device-pw" placeholder="••••••••" autocomplete="off" />
                             <button
@@ -102,15 +103,16 @@
             <div class="step-header">
                 <div class="step-number">2</div>
                 <div class="step-title">
-                    <div class="step-name">App configuration <span class="step-name-suffix">(optional)</span></div>
+                    <div class="step-name">Optional app folder</div>
                     <div class="step-state" id="step-folder-state">none</div>
                 </div>
             </div>
             <div class="step-body">
                 <label class="step-skip">
-                    <input type="checkbox" id="skip-step-folder" />
-                    <span>Skip — keep existing apps on board</span>
+                    <input type="checkbox" id="run-step-app" />
+                    <span>Deploy the selected app folder to every board</span>
                 </label>
+                <span class="muted">Off by default. Choosing a folder does not deploy it until this is enabled.</span>
                 <div id="folder-controls">
                     <label class="file-picker">
                         <input type="file" id="folder-input" webkitdirectory directory multiple />
@@ -121,16 +123,32 @@
                         <ul id="eim-list"></ul>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div class="step-arrow">→</div>
+
+        <div class="step" id="step-commands" data-status="optional">
+            <div class="step-header">
+                <div class="step-number">3</div>
+                <div class="step-title">
+                    <div class="step-name">Optional commands</div>
+                    <div class="step-state" id="step-commands-state">off</div>
+                </div>
+            </div>
+            <div class="step-body">
+                <label class="step-skip">
+                    <input type="checkbox" id="run-step-post-update" />
+                    <span>Run commands after setup</span>
+                </label>
                 <label class="post-update-label">
-                    Post-update commands (one command per line, run in order)
+                    One command per line, run in order
                     <textarea
                         id="post-update-cmd"
                         rows="5"
-                        placeholder="leave empty to skip"
-                    >arduino-app-cli app start user:workshop-racing-telemetry-unoq
-arduino-app-cli app stop user:workshop-racing-telemetry-unoq
-arduino-app-cli app start examples:inspirational/real-time-accelerometer
-arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textarea>
+                        placeholder="Optional commands"
+                    ></textarea>
+                    <span class="muted" id="post-update-hint">Enable this step to add commands.</span>
                 </label>
             </div>
         </div>
@@ -139,49 +157,87 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
 
         <div class="step" id="step-run" data-status="pending">
             <div class="step-header">
-                <div class="step-number">3</div>
+                <div class="step-number">4</div>
                 <div class="step-title">
-                    <div class="step-name">Run</div>
+                    <div class="step-name">Setup all boards</div>
                     <div class="step-state" id="step-run-state">0 boards ready</div>
                 </div>
             </div>
             <div class="step-body">
+                <div class="recommended-setup">
+                    <strong>Fresh board setup</strong>
+                    <span>Configure WiFi, complete App Lab onboarding, update software, and reuse saved downloads.</span>
+                    <div id="preflight-status" class="preflight-status">Checking this Mac and connected boards...</div>
+                </div>
                 <div class="run-mode" role="group" aria-label="Steps to run">
-                    <label class="run-mode-option">
-                        <input type="checkbox" id="run-step-wifi" checked />
+                    <label class="run-mode-option cache-mode-option">
+                        <input type="checkbox" id="run-use-package-cache" checked />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 1: Configure WiFi + device password</span>
-                            <span class="run-mode-desc">Runs push_env + change_password.</span>
+                            <span class="run-mode-title">Restore saved downloads and prepared apps (recommended)</span>
+                            <span class="run-mode-desc" id="package-cache-status">Cache status loading...</span>
+                            <span class="run-mode-desc" id="workshop-cache-status">No image bundle captured</span>
+                            <span class="run-mode-desc cache-help">Off: download everything fresh and do not restore the prepared-app cache.</span>
                         </span>
                     </label>
+                    <details class="advanced-options">
+                        <summary>Change fleet setup actions</summary>
+                        <div class="advanced-options-body">
                     <label class="run-mode-option">
-                        <input type="checkbox" id="run-step-app" checked />
+                        <input type="checkbox" id="run-step-properties" checked />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 2: Push app folder + properties</span>
-                            <span class="run-mode-desc">Requires a selected upload folder unless Step 2 card is skipped.</span>
+                            <span class="run-mode-title">Push properties.msgpack</span>
+                            <span class="run-mode-desc">Copies the selected folder's file, or the project default, independently.</span>
                         </span>
                     </label>
                     <label class="run-mode-option">
                         <input type="checkbox" id="run-step-setup" checked />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 3: Run setup script</span>
-                            <span class="run-mode-desc">Includes WiFi validation + arduino-app-cli system update.</span>
+                            <span class="run-mode-title">Run setup script</span>
+                            <span class="run-mode-desc">Includes WiFi validation, cached package downloads, and App Lab update.</span>
                         </span>
                     </label>
                     <label class="run-mode-option">
                         <input type="checkbox" id="run-step-prune" />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 4: Prune old Docker images</span>
-                            <span class="run-mode-desc">Optional cleanup before post-update.</span>
+                            <span class="run-mode-title">Prune old Docker images</span>
+                            <span class="run-mode-desc">Leave off unless a board is low on disk space; removes unused Docker data.</span>
                         </span>
                     </label>
+                        </div>
+                    </details>
+                    <details class="cache-preparation-options">
+                        <summary id="cache-preparation-summary">Cache-board preparation · 3 examples selected</summary>
+                        <div class="advanced-options-body">
+                    <span class="muted">Used only by “Prepare &amp; save shared cache” on one board. These choices do not run during all-board setup.</span>
                     <label class="run-mode-option">
-                        <input type="checkbox" id="run-step-post-update" checked />
+                        <input type="checkbox" id="run-step-warm-app" />
                         <span class="run-mode-label">
-                            <span class="run-mode-title">Step 5: Run post-update command</span>
-                            <span class="run-mode-desc">Uses the command configured in Step 2.</span>
+                            <span class="run-mode-title">Prepare uploaded app on cache board</span>
+                            <span class="run-mode-desc">Warm cache only: starts and stops the uploaded app, then captures its cache for other boards.</span>
                         </span>
                     </label>
+                    <div class="run-mode-option example-run-option">
+                        <span class="run-mode-label">
+                            <span class="run-mode-title">Prepare examples on cache board</span>
+                            <span class="run-mode-desc">Used by Warm cache only; fleet runs restore the captured files instead.</span>
+                            <details class="example-picker" id="example-picker">
+                                <summary id="example-picker-summary">No examples selected</summary>
+                                <div class="example-picker-menu">
+                                    <input id="example-search" type="search" placeholder="Filter examples" />
+                                    <div class="example-picker-actions">
+                                        <button type="button" class="btn btn-small" id="select-inspirational-btn">Select inspirational</button>
+                                        <button type="button" class="btn btn-small" id="clear-examples-btn">Clear</button>
+                                    </div>
+                                    <div id="example-options" class="example-options">
+                                        <span class="muted">Connect a board to load examples.</span>
+                                    </div>
+                                </div>
+                            </details>
+                        </span>
+                    </div>
+                        </div>
+                    </details>
+                    <button type="button" class="btn btn-small" id="reset-recommended-btn">Restore recommended defaults</button>
                 </div>
                 <div class="step-actions">
                     <button id="run-btn" class="btn btn-primary" disabled>Run selected steps on all boards</button>
@@ -194,6 +250,47 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
             </div>
         </div>
     </section>
+
+    <details class="recovery-panel">
+        <summary>Factory reset: flash the latest image to one board</summary>
+        <div class="recovery-body">
+            <div class="recovery-warning">
+                <strong>Factory reset: flashing can erase all data on the board.</strong> Connect exactly one board in EDL mode at a time. Use normal setup only after it boots again.
+            </div>
+            <ol class="recovery-steps">
+                <li>Disconnect the board from USB-C.</li>
+                <li>Bridge the two EDL pins with a jumper cap.</li>
+                <li>While the pins are bridged, connect USB-C. You may then remove the jumper.</li>
+                <li>After flashing, unplug USB-C, remove the jumper, and reconnect the board.</li>
+            </ol>
+            <div id="flash-tool-status" class="muted">Checking Arduino Flasher CLI...</div>
+            <div id="flash-image-status" class="muted">Checking the latest image...</div>
+            <div id="flash-disk-status" class="muted">Checking available disk space...</div>
+            <div id="flash-device-status" class="muted">Checking for an EDL board...</div>
+            <a class="recovery-help" href="https://docs.arduino.cc/software/app-lab/configure/flash/" target="_blank" rel="noreferrer">Official Arduino flashing and EDL instructions</a>
+            <label class="run-mode-option">
+                <input type="checkbox" id="flash-preserve-user" />
+                <span class="run-mode-label">
+                    <span class="run-mode-title">Try to preserve user files</span>
+                    <span class="run-mode-desc">Leave off for the cleanest fresh-board setup. Flashing can erase the board.</span>
+                </span>
+            </label>
+            <label class="run-mode-option recovery-confirm">
+                <input type="checkbox" id="flash-edl-confirm" />
+                <span class="run-mode-label">
+                    <span class="run-mode-title">I bridged the EDL pins before connecting USB-C</span>
+                    <span class="run-mode-desc">The app will also require exactly one EDL board to be detected.</span>
+                </span>
+            </label>
+            <div class="step-actions">
+                <button id="flash-refresh-btn" class="btn btn-small">Check again</button>
+                <button id="flash-start-btn" class="btn btn-danger" disabled>Flash latest image</button>
+                <button id="flash-cancel-btn" class="btn btn-small" hidden>Cancel</button>
+            </div>
+            <div id="flash-result" class="muted"></div>
+            <pre id="flash-log" class="log-panel recovery-log" hidden></pre>
+        </div>
+    </details>
 
     <main id="devices-grid" class="devices-grid"></main>
 
@@ -209,18 +306,26 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
                     <span class="wifi-badge" data-status="unknown" title="No WiFi check yet">WiFi ?</span>
                     <button class="btn btn-small identify-btn" title="Blink the red LED to find this board on the bench">Identify</button>
                     <button class="btn btn-small wifi-check-btn" title="Run quick WiFi and internet connectivity checks">WiFi Check</button>
+                    <button class="btn btn-small warm-cache-btn" title="Update this board, start and stop the selected apps and examples, then save their reusable files">Prepare &amp; save shared cache</button>
                     <button class="btn btn-small retry-btn" hidden>Retry</button>
+                    <button class="btn btn-small btn-secondary diagnose-btn" hidden>Diagnose and fix with Copilot</button>
                 </div>
             </div>
             <div class="progress-row">
                 <div class="progress-bar"><div class="progress-fill"></div></div>
                 <span class="current-stage">—</span>
             </div>
-            <div class="skip-row">
-                <label><input type="checkbox" class="skip-toggle" data-stage="change_password" /> skip password</label>
-                <label><input type="checkbox" class="skip-toggle" data-stage="push_properties" /> skip properties</label>
-                <label><input type="checkbox" class="skip-toggle" data-stage="post_update" /> skip post-update</label>
-            </div>
+            <details class="device-advanced">
+                <summary>Board options</summary>
+                <span class="muted">Overrides below apply only to this board and can leave it different from the rest of the fleet.</span>
+                <div class="skip-row">
+                    <label><input type="checkbox" class="skip-toggle" data-stage="change_password" /> Skip password change on this board</label>
+                    <label><input type="checkbox" class="skip-toggle" data-stage="push_properties" /> Skip App Lab onboarding on this board</label>
+                    <label><input type="checkbox" class="skip-toggle" data-stage="post_update" /> Skip custom commands on this board</label>
+                </div>
+                <button class="btn btn-small capture-cache-btn" title="Save files already present without starting any selected apps or examples">Save current files as cache</button>
+                <span class="muted">Advanced: captures the board as-is without preparing selected apps or examples.</span>
+            </details>
             <div class="failure-reason" hidden></div>
             <div class="summary-panel" hidden>
                 <div class="summary-header">Update summary</div>
@@ -236,6 +341,6 @@ arduino-app-cli app stop examples:inspirational/real-time-accelerometer</textare
         </div>
     </template>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=21"></script>
 </body>
 </html>

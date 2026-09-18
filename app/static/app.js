@@ -2,7 +2,6 @@
 // Single page; no build step.
 
 const STAGES = [
-    "push_app",
     "push_setup_script",
     "push_env",
     "chmod_script",
@@ -10,17 +9,47 @@ const STAGES = [
     "push_properties",
     "run_setup",
     "prune_docker_images",
+    "restore_workshop_cache",
+    "push_app",
+    "prepare_uploaded_app",
+    "prepare_examples",
     "post_update",
+    "verify_ready",
+    "capture_cache",
 ];
 
-// Stages skipped when "Skip Step 1" (WiFi creds) toggle is on.
 const SKIP_STEP_WIFI_STAGES = ["push_env", "change_password"];
 
-// Stages skipped when "Skip Step 2" (app folder) toggle is on. push_app is
-// also implicitly skipped because the request goes out with upload_id=null.
-const SKIP_STEP_FOLDER_STAGES = ["push_properties"];
-
 const DEVICE_POLL_MS = 5000;
+const UI_PREFS_KEY = "unoq-flasher-ui-v1";
+const UI_UPLOAD_KEY = "unoq-flasher-upload-v1";
+const RECOMMENDED_EXAMPLES = [
+    {
+        id: "examples:blink",
+        name: "Blink LED",
+        description: "Blink LED from Python",
+    },
+    {
+        id: "examples:real-time-accelerometer",
+        name: "Real-time Accelerometer",
+        description: "Accelerometer inspiration",
+    },
+    {
+        id: "examples:inspirational/platform_unoq/edge-ai-assistant",
+        name: "Edge AI Assistant",
+        description: "Chatbot powered by a local LLM",
+    },
+];
+const PERSISTED_CONTROL_IDS = [
+    "run-use-package-cache",
+    "run-step-wifi",
+    "run-step-properties",
+    "run-step-setup",
+    "run-step-prune",
+    "run-step-app",
+    "run-step-warm-app",
+    "run-step-post-update",
+];
 
 const state = {
     upload: null,
@@ -30,8 +59,14 @@ const state = {
     runId: null,
     ws: null,
     wifiOk: false,
-    skipStep1: false,
-    skipStep2: false,
+    examples: [],
+    exampleSource: null,
+    savedExampleIds: new Set(),
+    flashStatus: null,
+    flashPoll: null,
+    health: null,
+    cacheIntegrity: "unchecked",
+    settingsLoaded: false,
 
     runFinalStatusText: null,
 };
@@ -42,11 +77,33 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 // ---------- bootstrap ----------
 
 async function init() {
+    restoreUiPreferences();
     wireControls();
+    renderFolderStepFromState();
+    await restoreStagedUpload();
     await populateSettingsForm();
     await refreshHealth();
+    await verifyWorkshopCache();
     await refreshDevices();
+    refreshFlashStatus();
     setInterval(refreshDevices, DEVICE_POLL_MS);
+}
+
+async function restoreStagedUpload() {
+    const uploadId = localStorage.getItem(UI_UPLOAD_KEY);
+    if (!uploadId) return;
+    try {
+        const response = await fetch(`/api/uploads/${encodeURIComponent(uploadId)}`);
+        if (!response.ok) throw new Error("expired");
+        state.upload = await response.json();
+        renderFolderStepFromState();
+        renderEimList(state.upload.eim_files || []);
+    } catch (_) {
+        localStorage.removeItem(UI_UPLOAD_KEY);
+        state.upload = null;
+        renderFolderStepFromState();
+        $("#step-folder-state").textContent = "Previous folder expired; choose it again if needed";
+    }
 }
 
 function wireControls() {
@@ -58,19 +115,44 @@ function wireControls() {
     $("#wifi-check-all-btn")?.addEventListener("click", wifiCheckAllDevices);
     $("#run-btn").addEventListener("click", () => startRun());
     $("#save-settings-btn").addEventListener("click", saveSettings);
-    $("#skip-step-wifi").addEventListener("change", onSkipWifiToggle);
-    $("#skip-step-folder").addEventListener("change", onSkipFolderToggle);
+    $("#reset-recommended-btn")?.addEventListener("click", resetRecommendedSetup);
+    $("#flash-refresh-btn")?.addEventListener("click", refreshFlashStatus);
+    $("#flash-edl-confirm")?.addEventListener("change", updateFlashButton);
+    $("#flash-start-btn")?.addEventListener("click", startImageFlash);
+    $("#flash-cancel-btn")?.addEventListener("click", cancelImageFlash);
     for (const id of [
         "#run-step-wifi",
         "#run-step-app",
+        "#run-step-properties",
         "#run-step-setup",
         "#run-step-prune",
+        "#run-step-warm-app",
         "#run-step-post-update",
+        "#run-use-package-cache",
     ]) {
         const el = $(id);
-        if (el) el.addEventListener("change", updateStartButtons);
+        if (el) el.addEventListener("change", () => {
+            saveUiPreferences();
+            if (id === "#run-step-wifi") renderWifiStepFromState();
+            if (id === "#run-step-app") renderFolderStepFromState();
+            updateStartButtons();
+        });
     }
-    $("#post-update-cmd")?.addEventListener("input", updateStartButtons);
+    $("#post-update-cmd")?.addEventListener("input", () => {
+        saveUiPreferences();
+        updateStartButtons();
+    });
+    $("#example-search")?.addEventListener("input", renderExampleOptions);
+    $("#select-inspirational-btn")?.addEventListener("click", () => {
+        for (const example of state.examples) example.selected = example.inspirational;
+        saveUiPreferences();
+        renderExampleOptions();
+    });
+    $("#clear-examples-btn")?.addEventListener("click", () => {
+        for (const example of state.examples) example.selected = false;
+        saveUiPreferences();
+        renderExampleOptions();
+    });
     for (const btn of $$(".pw-toggle")) {
         btn.addEventListener("click", (e) => {
             e.preventDefault();
@@ -78,6 +160,169 @@ function wireControls() {
             togglePasswordVisibility(btn);
         });
     }
+}
+
+function resetRecommendedSetup() {
+    if (!window.confirm("Restore recommended defaults? This clears custom commands and replaces your selected cache examples.")) return;
+    const checked = {
+        "run-use-package-cache": true,
+        "run-step-wifi": true,
+        "run-step-properties": true,
+        "run-step-setup": true,
+        "run-step-prune": false,
+        "run-step-app": false,
+        "run-step-warm-app": false,
+        "run-step-post-update": false,
+    };
+    for (const [id, value] of Object.entries(checked)) $(`#${id}`).checked = value;
+    $("#post-update-cmd").value = "";
+    applyRecommendedExamples();
+    saveUiPreferences();
+    renderWifiStepFromState();
+    renderFolderStepFromState();
+    renderExampleOptions();
+    updateStartButtons();
+}
+
+function applyRecommendedExamples() {
+    const recommendedIds = new Set(RECOMMENDED_EXAMPLES.map((example) => example.id));
+    for (const example of state.examples) example.selected = recommendedIds.has(example.id);
+    state.savedExampleIds = recommendedIds;
+}
+
+async function refreshFlashStatus() {
+    try {
+        const response = await fetch("/api/flashing/status");
+        const status = await response.json();
+        state.flashStatus = status;
+        $("#flash-tool-status").textContent = status.tool_available
+            ? "Arduino Flasher CLI is ready from this project."
+            : "Arduino Flasher CLI is not available for this computer.";
+        const image = status.image || {};
+        $("#flash-image-status").textContent = image.available
+            ? image.cached
+                ? `Latest image ${image.version} is verified and saved on this Mac.`
+                : `Latest image ${image.version} will download once, then be reused for each board.`
+            : `Could not check the latest image${image.error ? `: ${image.error}` : "."}`;
+        const enoughDisk = status.free_bytes >= status.required_free_bytes;
+        $("#flash-disk-status").textContent = enoughDisk
+            ? `${formatBytes(status.free_bytes)} free; image flashing has enough workspace.`
+            : `${formatBytes(status.free_bytes)} free; at least ${formatBytes(status.required_free_bytes)} is required.`;
+        const deviceText = status.edl_devices === 1
+            ? "One EDL board detected and ready."
+            : `${status.edl_devices} EDL boards detected; connect exactly one.`;
+        $("#flash-device-status").textContent = deviceText;
+        const active = status.status === "starting" || status.status === "running";
+        $("#flash-result").textContent = active
+            ? "Flashing in progress. Do not disconnect the board."
+            : status.status === "succeeded"
+                ? "Flash complete. Unplug USB-C, remove the EDL jumper, then reconnect."
+                : status.status === "failed"
+                    ? `Flash failed (exit ${status.exit_code}). Check the log below.`
+                    : status.status === "canceled"
+                        ? "Image operation canceled. The board was not reported as successfully flashed."
+                    : "";
+        $("#flash-cancel-btn").hidden = !active;
+        const log = $("#flash-log");
+        log.textContent = (status.logs || []).join("\n");
+        log.hidden = !status.logs?.length;
+        updateFlashButton();
+        if (active && !state.flashPoll) {
+            state.flashPoll = setInterval(refreshFlashStatus, 1000);
+        } else if (!active && state.flashPoll) {
+            clearInterval(state.flashPoll);
+            state.flashPoll = null;
+        }
+    } catch (_) {
+        $("#flash-tool-status").textContent = "Unable to check image flashing support.";
+    }
+}
+
+async function cancelImageFlash() {
+    if (!window.confirm("Cancel the current image operation?")) return;
+    $("#flash-cancel-btn").disabled = true;
+    try {
+        const response = await fetch("/api/flashing/cancel", {method: "POST"});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Unable to cancel");
+    } catch (error) {
+        $("#flash-result").textContent = error.message;
+    } finally {
+        $("#flash-cancel-btn").disabled = false;
+        await refreshFlashStatus();
+    }
+}
+
+function updateFlashButton() {
+    const status = state.flashStatus;
+    const active = status?.status === "starting" || status?.status === "running";
+    $("#flash-start-btn").disabled = !status?.tool_available
+        || status?.edl_devices !== 1
+        || status?.free_bytes < status?.required_free_bytes
+        || !$("#flash-edl-confirm").checked
+        || active;
+}
+
+async function startImageFlash() {
+    const preserveUser = $("#flash-preserve-user").checked;
+    const warning = preserveUser
+        ? "Flash the detected UNO Q and try to preserve user files?"
+        : "Erase and flash the detected UNO Q with the latest image?";
+    if (!window.confirm(`${warning}\n\nDo not disconnect it until flashing completes.`)) return;
+    $("#flash-start-btn").disabled = true;
+    try {
+        const response = await fetch("/api/flashing/start", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                edl_pins_confirmed: $("#flash-edl-confirm").checked,
+                preserve_user: preserveUser,
+            }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Unable to start flashing");
+        $("#flash-edl-confirm").checked = false;
+        await refreshFlashStatus();
+    } catch (error) {
+        $("#flash-result").textContent = error.message;
+        await refreshFlashStatus();
+    }
+}
+
+function restoreUiPreferences() {
+    let preferences = {};
+    try {
+        preferences = JSON.parse(localStorage.getItem(UI_PREFS_KEY) || "{}");
+    } catch (_) {
+        preferences = {};
+    }
+    for (const id of PERSISTED_CONTROL_IDS) {
+        if (typeof preferences[id] === "boolean" && $(`#${id}`)) {
+            $(`#${id}`).checked = preferences[id];
+        }
+    }
+    const postUpdateControl = $("#post-update-cmd");
+    if (postUpdateControl && typeof preferences.postUpdateCmd === "string") {
+        postUpdateControl.value = preferences.postUpdateCmd;
+    }
+    state.savedExampleIds = new Set(
+        Array.isArray(preferences.exampleApps)
+            ? preferences.exampleApps
+            : RECOMMENDED_EXAMPLES.map((example) => example.id),
+    );
+}
+
+function saveUiPreferences() {
+    const preferences = {};
+    for (const id of PERSISTED_CONTROL_IDS) {
+        const control = $(`#${id}`);
+        if (control) preferences[id] = control.checked;
+    }
+    preferences.postUpdateCmd = $("#post-update-cmd")?.value || "";
+    preferences.exampleApps = state.examples.length
+        ? selectedExampleIds()
+        : [...state.savedExampleIds];
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify(preferences));
 }
 
 function togglePasswordVisibility(btn) {
@@ -90,33 +335,27 @@ function togglePasswordVisibility(btn) {
     btn.setAttribute("aria-label", (nowShowing ? "Hide " : "Show ") + which);
 }
 
-function onSkipWifiToggle(e) {
-    state.skipStep1 = e.target.checked;
-    renderWifiStepFromState();
-    updateStartButtons();
-}
-
-function onSkipFolderToggle(e) {
-    state.skipStep2 = e.target.checked;
-    renderFolderStepFromState();
-    updateStartButtons();
-}
-
 // ---------- health & WiFi step ----------
 
 async function refreshHealth() {
     try {
         const r = await fetch("/api/health");
         const j = await r.json();
+        state.health = j;
         const el = $("#health");
         if (!j.adb_available) {
             el.className = "health bad";
             el.textContent = `ADB not found: ${j.adb_error}`;
+        } else if (!j.setup_script_available || !j.properties_available) {
+            el.className = "health bad";
+            el.textContent = "required project file missing";
         } else {
             el.className = "health ok";
             const pw = j.password_configured ? "device pw set" : "no device pw";
             el.textContent = `ADB ready · ${pw}`;
         }
+        renderPackageCacheStatus(j.package_cache);
+        renderWorkshopCacheStatus(j.workshop_cache);
         state.wifiOk = j.wifi_ssid_configured && j.wifi_password_configured;
         renderWifiStep(j);
         updateStartButtons();
@@ -127,6 +366,55 @@ async function refreshHealth() {
     }
 }
 
+async function verifyWorkshopCache() {
+    const el = $("#workshop-cache-status");
+    if (el) el.textContent = "Checking saved app and toolchain files...";
+    try {
+        const response = await fetch("/api/cache/verify", {method: "POST"});
+        const cache = await response.json();
+        if (!response.ok) throw new Error(cache.detail || `HTTP ${response.status}`);
+        state.cacheIntegrity = cache.integrity;
+        renderWorkshopCacheStatus(cache);
+    } catch (error) {
+        state.cacheIntegrity = "invalid";
+        if (el) el.textContent = `Could not verify saved files: ${error}`;
+    }
+    updateStartButtons();
+}
+
+function renderPackageCacheStatus(cache) {
+    const el = $("#package-cache-status");
+    if (!el || !cache) return;
+    const size = formatBytes(cache.size_bytes || 0);
+    const served = formatBytes(cache.bytes_from_cache || 0);
+    el.textContent = cache.running
+        ? `${size} stored · ${cache.hits || 0} hits · ${served} served from Mac`
+        : "Package cache is not running";
+}
+
+function renderWorkshopCacheStatus(cache) {
+    const el = $("#workshop-cache-status");
+    if (!el || !cache) return;
+    if (!cache.images_ready) {
+        state.cacheIntegrity = cache.integrity || "verified";
+        el.textContent = "No prepared-app checkpoint yet; package downloads are still cached";
+        return;
+    }
+    state.cacheIntegrity = cache.integrity || "unchecked";
+    if (state.cacheIntegrity === "invalid") {
+        el.textContent = "Prepared app cache is damaged. Prepare & save it again on one board, or turn restoration off.";
+        return;
+    }
+    const toolchain = cache.arduino_ready
+        ? ` + ${formatBytes(cache.arduino_archive_bytes)} toolchain`
+        : "";
+    const runtime = cache.app_runtime_ready
+        ? ` + ${formatBytes(cache.app_runtime_archive_bytes)} app cache`
+        : "";
+    const integrity = state.cacheIntegrity === "verified" ? "verified · " : "";
+    el.textContent = `${integrity}${cache.images.length} images · ${formatBytes(cache.image_archive_bytes)}${toolchain}${runtime} · source ${cache.source_device}`;
+}
+
 function renderWifiStep(health) {
     state.wifiHealth = health;
     renderWifiStepFromState();
@@ -135,9 +423,9 @@ function renderWifiStep(health) {
 function renderWifiStepFromState() {
     const step = $("#step-wifi");
     const stateEl = $("#step-wifi-state");
-    if (state.skipStep1) {
+    if (!$("#run-step-wifi")?.checked) {
         step.dataset.status = "skipped";
-        stateEl.textContent = "skipped — board keeps existing WiFi";
+        stateEl.textContent = "off — keeping board credentials";
         return;
     }
     const h = state.wifiHealth || {};
@@ -161,20 +449,20 @@ function renderWifiStepFromState() {
 function renderFolderStepFromState() {
     const step = $("#step-folder");
     const stateEl = $("#step-folder-state");
-    if (state.skipStep2) {
-        step.dataset.status = "skipped";
-        stateEl.textContent = "skipped — board keeps existing apps";
-        return;
-    }
+    const deploy = !!$("#run-step-app")?.checked;
     if (state.upload) {
-        step.dataset.status = "configured";
+        step.dataset.status = deploy ? "configured" : "optional";
         const mb = state.folderFiles ? approxSize(state.folderFiles) : "";
-        stateEl.textContent = mb
+        const folder = mb
             ? `${state.upload.folder_name} · ${state.upload.file_count} files · ${mb}`
             : `${state.upload.folder_name} · ${state.upload.file_count} files`;
+        stateEl.textContent = deploy ? `will deploy · ${folder}` : `selected, deployment off · ${folder}`;
+    } else if (deploy) {
+        step.dataset.status = "warning";
+        stateEl.textContent = "choose a folder";
     } else {
         step.dataset.status = "optional";
-        stateEl.textContent = "none";
+        stateEl.textContent = "off";
     }
 }
 
@@ -183,6 +471,7 @@ function renderFolderStepFromState() {
 async function populateSettingsForm() {
     try {
         const r = await fetch("/api/settings");
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();
         // Pre-populate all three fields with the actual saved values so the
         // user can (a) verify them with the show/hide button, and (b) edit
@@ -195,8 +484,13 @@ async function populateSettingsForm() {
         $("#setting-device-pw").placeholder = j.UNOQ_DEFAULT_PASSWORD_set
             ? "(set — click show to reveal)" : "••••••••";
         renderEnvFilePath(j);
+        state.settingsLoaded = true;
+        $("#settings-status").textContent = "loaded";
+        updateStartButtons();
     } catch (e) {
+        state.settingsLoaded = false;
         $("#settings-status").textContent = `load failed: ${e}`;
+        updateStartButtons();
     }
 }
 
@@ -224,10 +518,14 @@ async function saveSettings() {
     // currently in them. An intentionally-cleared field will overwrite the
     // stored value with an empty string.
     const body = {
-        UNOQ_WIFI_SSID: $("#setting-ssid").value,
+        UNOQ_WIFI_SSID: $("#setting-ssid").value.trim(),
         UNOQ_WIFI_PASSWORD: $("#setting-wifi-pw").value,
         UNOQ_DEFAULT_PASSWORD: $("#setting-device-pw").value,
     };
+    if ($("#run-step-wifi")?.checked && (!body.UNOQ_WIFI_SSID || !body.UNOQ_WIFI_PASSWORD)) {
+        $("#settings-status").textContent = "WiFi name and password are required";
+        return;
+    }
     try {
         const r = await fetch("/api/settings", {
             method: "POST",
@@ -263,6 +561,7 @@ async function refreshDevices() {
         const j = await r.json();
         state.devices = j.devices;
         renderDeviceGrid();
+        await refreshExamples();
         updateStartButtons();
     } catch (e) {
         updateRunStepState("error fetching devices");
@@ -288,8 +587,11 @@ function renderDeviceGrid() {
         const stageEl = node.querySelector(".current-stage");
         const logEl = node.querySelector(".log-panel");
         const retryBtn = node.querySelector(".retry-btn");
+        const diagnoseBtn = node.querySelector(".diagnose-btn");
         const identifyBtn = node.querySelector(".identify-btn");
         const wifiCheckBtn = node.querySelector(".wifi-check-btn");
+        const captureCacheBtn = node.querySelector(".capture-cache-btn");
+        const warmCacheBtn = node.querySelector(".warm-cache-btn");
         const wifiBadgeEl = node.querySelector(".wifi-badge");
         const elapsedEl = node.querySelector(".elapsed");
         const failureEl = node.querySelector(".failure-reason");
@@ -304,13 +606,18 @@ function renderDeviceGrid() {
         });
 
         retryBtn.addEventListener("click", () => retryDevice(d.serial));
+        diagnoseBtn.addEventListener("click", () => diagnoseWithCopilot(d.serial));
         identifyBtn.addEventListener("click", () => identifyDevice(d.serial));
         wifiCheckBtn.addEventListener("click", () => wifiCheckDevice(d.serial));
+        captureCacheBtn.addEventListener("click", () => captureImageCache(d.serial));
+        warmCacheBtn.addEventListener("click", () => startRun(d.serial, true));
 
         grid.appendChild(node);
         state.cards.set(d.serial, {
-            card: node, badgeEl, progressEl, stageEl, logEl, retryBtn, identifyBtn,
+            card: node, badgeEl, progressEl, stageEl, logEl, retryBtn, diagnoseBtn, identifyBtn,
             wifiCheckBtn, wifiBadgeEl, elapsedEl, failureEl, summaryEl, skipInputs, logFollowState,
+            captureCacheBtn,
+            warmCacheBtn,
         });
     }
 
@@ -322,6 +629,115 @@ function renderDeviceGrid() {
                 state.cards.delete(serial);
             }
         }
+    }
+}
+
+async function refreshExamples() {
+    const serial = state.devices[0]?.serial;
+    if (!serial) {
+        state.examples = [];
+        state.exampleSource = null;
+        renderExampleOptions();
+        return;
+    }
+    if (state.exampleSource === serial && state.examples.length > 0) return;
+    const selected = new Set([...state.savedExampleIds, ...selectedExampleIds()]);
+    try {
+        const response = await fetch(`/api/devices/${encodeURIComponent(serial)}/examples`);
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+        state.examples = (result.examples || []).map((example) => ({
+            ...example,
+            selected: selected.has(example.id),
+        }));
+        for (const recommended of RECOMMENDED_EXAMPLES) {
+            if (selected.has(recommended.id) && !state.examples.some((example) => example.id === recommended.id)) {
+                state.examples.push({
+                    ...recommended,
+                    inspirational: true,
+                    status: "not listed on this board",
+                    selected: true,
+                });
+            }
+        }
+        state.exampleSource = serial;
+        state.savedExampleIds.clear();
+        renderExampleOptions();
+    } catch (error) {
+        $("#example-options").textContent = `Could not load examples: ${error}`;
+    }
+}
+
+function selectedExampleIds() {
+    return state.examples.filter((example) => example.selected).map((example) => example.id);
+}
+
+function renderExampleOptions() {
+    const container = $("#example-options");
+    if (!container) return;
+    const query = ($("#example-search")?.value || "").trim().toLowerCase();
+    container.innerHTML = "";
+    for (const example of state.examples) {
+        const haystack = `${example.name} ${example.id} ${example.description}`.toLowerCase();
+        if (query && !haystack.includes(query)) continue;
+        const label = document.createElement("label");
+        label.className = "example-option";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = example.selected;
+        input.addEventListener("change", () => {
+            example.selected = input.checked;
+            saveUiPreferences();
+            updateExampleSummary();
+            updateRunStepState();
+        });
+        const text = document.createElement("span");
+        text.textContent = `${example.name} · ${example.id}`;
+        label.append(input, text);
+        container.appendChild(label);
+    }
+    if (!container.children.length) {
+        const empty = document.createElement("span");
+        empty.className = "muted";
+        empty.textContent = state.examples.length ? "No matching examples." : "No examples available.";
+        container.appendChild(empty);
+    }
+    updateExampleSummary();
+    updateRunStepState();
+}
+
+function updateExampleSummary() {
+    const count = selectedExampleIds().length;
+    const summary = $("#example-picker-summary");
+    if (summary) summary.textContent = count ? `${count} example${count === 1 ? "" : "s"} selected` : "No examples selected";
+    const cacheSummary = $("#cache-preparation-summary");
+    if (cacheSummary) cacheSummary.textContent = `Cache-board preparation · ${count ? `${count} example${count === 1 ? "" : "s"} selected` : "no examples selected"}`;
+}
+
+async function captureImageCache(serial) {
+    const c = state.cards.get(serial);
+    if (!c) return;
+    const btn = c.captureCacheBtn;
+    btn.disabled = true;
+    btn.textContent = "Saving...";
+    appendLog(serial, "Capturing all tagged Docker images to the Mac cache...", "info");
+    try {
+        const response = await fetch(`/api/cache/workshop/${encodeURIComponent(serial)}`, {
+            method: "POST",
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+        appendLog(
+            serial,
+            `Captured ${result.images.length} images, ${formatBytes(result.arduino_archive_bytes)} toolchain, and ${formatBytes(result.app_runtime_archive_bytes)} app cache.`,
+            "info",
+        );
+        await verifyWorkshopCache();
+    } catch (error) {
+        appendLog(serial, `image capture failed: ${error}`, "err");
+    } finally {
+        btn.disabled = false;
+        btn.textContent = "Save current files as cache";
     }
 }
 
@@ -353,6 +769,9 @@ async function onFolderPicked(e) {
         }
         const j = await r.json();
         state.upload = j;
+        localStorage.setItem(UI_UPLOAD_KEY, j.upload_id);
+        $("#run-step-app").checked = true;
+        saveUiPreferences();
         renderFolderStepFromState();
         renderEimList(j.eim_files || []);
         updateStartButtons();
@@ -395,6 +814,7 @@ function renderEimList(eimFiles) {
 function formatBytes(n) {
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
     return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -404,7 +824,7 @@ function approxSize(files) {
     return formatBytes(total);
 }
 
-// ---------- Step 3: run buttons ----------
+// ---------- Step 4: run buttons ----------
 
 function updateStartButtons() {
     const haveDevices = state.devices.length > 0;
@@ -412,29 +832,41 @@ function updateStartButtons() {
     const idle = state.runId === null;
     const doWifi = !!$("#run-step-wifi")?.checked;
     const doApp = !!$("#run-step-app")?.checked;
+    const doProperties = !!$("#run-step-properties")?.checked;
     const doSetup = !!$("#run-step-setup")?.checked;
     const doPost = !!$("#run-step-post-update")?.checked;
     const doPrune = !!$("#run-step-prune")?.checked;
+    const useCache = !!$("#run-use-package-cache")?.checked;
     const postCmd = (($("#post-update-cmd")?.value) || "").trim();
+    const setupAvailable = !!state.health?.setup_script_available;
+    const propertiesAvailable = !!state.health?.properties_available
+        || !!state.upload?.properties_available;
 
-    const step1ok = state.wifiOk || state.skipStep1;
-    const step2ok = haveFolder || state.skipStep2;
+    const step1ok = state.wifiOk;
+    const step2ok = haveFolder;
 
-    const needsStep1Inputs = doWifi && !state.skipStep1;
-    const needsStep2Inputs = doApp && !state.skipStep2;
+    const needsStep1Inputs = doWifi;
+    const needsStep2Inputs = doApp;
     const needsPostCommand = doPost;
+    const hasSelectedAction = doWifi || doApp || doProperties || doSetup || doPrune || doPost;
     const ready = haveDevices
         && idle
+        && hasSelectedAction
         && (!needsStep1Inputs || step1ok)
         && (!needsStep2Inputs || step2ok)
-        && (!needsPostCommand || postCmd.length > 0);
+        && (!needsPostCommand || postCmd.length > 0)
+        && (!doSetup || setupAvailable)
+        && (!doProperties || propertiesAvailable)
+        && (!useCache || state.cacheIntegrity !== "invalid")
+        && state.settingsLoaded;
 
     const btn = $("#run-btn");
     btn.disabled = !ready;
     if (ready) {
         const selected = ["run setup"];
-        if (doWifi && !state.skipStep1) selected.unshift("WiFi/password");
-        if (doApp && !state.skipStep2) selected.unshift("app push");
+        if (doWifi) selected.unshift("WiFi/password");
+        if (doApp) selected.unshift("app push");
+        if (doProperties) selected.push("properties");
         if (!doSetup) selected.splice(selected.indexOf("run setup"), 1);
         if (doPrune) selected.push("docker prune");
         if (doPost) selected.push("post-update");
@@ -454,10 +886,77 @@ function updateStartButtons() {
             needsStep2Inputs,
             needsPostCommand,
             postCmd,
+            doSetup,
+            setupAvailable,
+            doProperties,
+            propertiesAvailable,
         });
     }
 
+    updatePreflightStatus({ready, haveDevices, haveFolder, doWifi, doApp, doPost,
+        postCmd, doSetup, setupAvailable, doProperties, propertiesAvailable, step1ok, useCache});
+    syncDeviceOverrides({doWifi, doProperties, doPost});
+    updateCommandStepState(doPost, postCmd);
     updateRunStepState();
+}
+
+function syncDeviceOverrides({doWifi, doProperties, doPost}) {
+    const enabled = {
+        change_password: doWifi,
+        push_properties: doProperties,
+        post_update: doPost,
+    };
+    for (const card of state.cards.values()) {
+        for (const input of card.skipInputs) {
+            input.closest("label").hidden = !enabled[input.dataset.stage];
+        }
+    }
+}
+
+function updateCommandStepState(enabled, commandText) {
+    const step = $("#step-commands");
+    const stateEl = $("#step-commands-state");
+    const commandCount = commandText.split("\n").filter((line) => line.trim()).length;
+    step.dataset.status = !enabled ? "skipped" : commandCount ? "configured" : "warning";
+    stateEl.textContent = !enabled
+        ? "off"
+        : commandCount
+            ? `${commandCount} command${commandCount === 1 ? "" : "s"}`
+            : "command required";
+    $("#post-update-hint").textContent = !enabled
+        ? "Off: no custom commands will run."
+        : commandCount
+            ? `${commandCount} command${commandCount === 1 ? "" : "s"} will run after setup.`
+            : "Add at least one command or turn this step off.";
+}
+
+function updatePreflightStatus({ready, haveDevices, haveFolder, doWifi, doApp, doPost,
+    postCmd, doSetup, setupAvailable, doProperties, propertiesAvailable, step1ok, useCache}) {
+    const issues = [];
+    if (!state.settingsLoaded) issues.push("settings did not load");
+    if (!haveDevices) issues.push("connect at least one board over USB-C");
+    if (doWifi && !step1ok) issues.push("save the WiFi name and password in Section 1");
+    if (doApp && !haveFolder) issues.push("choose an app folder in Section 2 or turn deployment off");
+    if (doPost && !postCmd) issues.push("add commands in Section 3 or turn commands off");
+    if (doSetup && !setupAvailable) issues.push("unoq-setup.sh is missing");
+    if (doProperties && !propertiesAvailable) issues.push("properties.msgpack is missing");
+    if (useCache && state.cacheIntegrity === "invalid") issues.push("prepare the damaged cache again or turn cache restoration off");
+    const el = $("#preflight-status");
+    el.dataset.status = ready ? "ready" : "waiting";
+    el.replaceChildren();
+    if (ready) {
+        el.textContent = `${state.devices.length} board${state.devices.length === 1 ? "" : "s"} ready for the recommended setup.`;
+        return;
+    }
+    const heading = document.createElement("strong");
+    heading.textContent = "Before setup:";
+    const list = document.createElement("ul");
+    for (const issue of issues) {
+        const item = document.createElement("li");
+        item.textContent = issue;
+        list.appendChild(item);
+    }
+    el.append(heading, list);
 }
 
 function missingFor({
@@ -469,13 +968,21 @@ function missingFor({
     needsStep2Inputs,
     needsPostCommand,
     postCmd,
+    doSetup,
+    setupAvailable,
+    doProperties,
+    propertiesAvailable,
 }) {
     if (!idle) return "A run is in progress";
     const missing = [];
     if (!haveDevices) missing.push("connect at least one UNO Q");
     if (needsStep1Inputs && !step1ok) missing.push("configure WiFi or uncheck Step 1 in Run");
-    if (needsStep2Inputs && !step2ok) missing.push("choose a folder or uncheck Step 2 in Run");
-    if (needsPostCommand && !postCmd) missing.push("set Post-update command or uncheck Step 5 in Run");
+    if (needsStep2Inputs && !step2ok) missing.push("choose a folder in Section 2 or turn deployment off");
+    if (needsPostCommand && !postCmd) missing.push("add a command in Step 3 or turn that step off");
+    if (doSetup && !setupAvailable) missing.push("restore unoq-setup.sh to the project root");
+    if (doProperties && !propertiesAvailable) missing.push("restore properties.msgpack or select an app folder containing it");
+    if (state.cacheIntegrity === "invalid") missing.push("prepare the cache again");
+    if (!state.settingsLoaded) missing.push("reload settings");
     return missing.length ? "Needed: " + missing.join("; ") : "";
 }
 
@@ -500,40 +1007,61 @@ function updateRunStepState(override) {
     }
     const doWifi = !!$("#run-step-wifi")?.checked;
     const doApp = !!$("#run-step-app")?.checked;
+    const doProperties = !!$("#run-step-properties")?.checked;
     const doSetup = !!$("#run-step-setup")?.checked;
     const doPrune = !!$("#run-step-prune")?.checked;
     const doPost = !!$("#run-step-post-update")?.checked;
-    const ready = (!doWifi || state.wifiOk || state.skipStep1);
+    const ready = (!doWifi || state.wifiOk);
     step.dataset.status = ready ? "ready" : "pending";
     const selected = [];
-    if (doWifi && !state.skipStep1) selected.push("step 1");
-    if (doApp && !state.skipStep2) selected.push("step 2");
-    if (doSetup) selected.push("step 3");
-    if (doPrune) selected.push("step 4");
-    if (doPost) selected.push("step 5");
+    if (doWifi) selected.push("WiFi");
+    if (doProperties) selected.push("properties");
+    if (doSetup) selected.push("setup");
+    if (doPrune) selected.push("prune");
+    if (doApp) selected.push("app folder");
+    if (doPost) selected.push("commands");
     if (selected.length === 0) selected.push("no-op");
     stateEl.textContent = `${n} board${n === 1 ? "" : "s"} · ${selected.join(", ")}`;
 }
 
 // ---------- runs ----------
 
-async function startRun() {
+async function startRun(targetSerial = null, warmCache = false) {
     if (state.devices.length === 0) return;
     state.runFinalStatusText = null;
 
     const doWifi = !!$("#run-step-wifi")?.checked;
     const doApp = !!$("#run-step-app")?.checked;
+    const doProperties = !!$("#run-step-properties")?.checked;
     const doSetup = !!$("#run-step-setup")?.checked;
     const doPostUpdate = !!$("#run-step-post-update")?.checked;
     const doPrune = !!$("#run-step-prune")?.checked;
+    const doWarmApp = !!$("#run-step-warm-app")?.checked;
+    const usePackageCache = !!$("#run-use-package-cache")?.checked;
+
+    if (warmCache && doWarmApp && !state.upload) {
+        $("#run-status").textContent = "Choose an app folder before preparing it on the cache board.";
+        return;
+    }
+
+    if (warmCache && !window.confirm(
+        `Prepare and save the shared cache from board ${targetSerial}?\n\nOnly this board will run. It will perform the enabled setup actions, prepare ${selectedExampleIds().length} selected example${selectedExampleIds().length === 1 ? "" : "s"}${doWarmApp ? " and the uploaded app" : ""}, then verify the files saved for later boards.`,
+    )) return;
 
     const baseSkip = [];
-    if (!doWifi || state.skipStep1) baseSkip.push(...SKIP_STEP_WIFI_STAGES);
-    if (!doApp || state.skipStep2) baseSkip.push("push_app", ...SKIP_STEP_FOLDER_STAGES);
+    if (!doWifi) baseSkip.push(...SKIP_STEP_WIFI_STAGES);
+    if (!doApp) baseSkip.push("push_app");
+    if (!doProperties) baseSkip.push("push_properties");
     if (!doSetup) baseSkip.push("push_setup_script", "chmod_script", "run_setup");
+    if (!doPrune) baseSkip.push("prune_docker_images");
+    if (!usePackageCache) baseSkip.push("restore_workshop_cache");
+    if (!warmCache || !doWarmApp) baseSkip.push("prepare_uploaded_app");
     if (!doPostUpdate) baseSkip.push("post_update");
 
-    const devices = state.devices.map((d) => {
+    const targetDevices = targetSerial
+        ? state.devices.filter((device) => device.serial === targetSerial)
+        : state.devices;
+    const devices = targetDevices.map((d) => {
         const userSkip = collectSkip(d.serial);
         const skip = Array.from(new Set([...baseSkip, ...userSkip]));
         return { serial: d.serial, skip_stages: skip };
@@ -543,11 +1071,26 @@ async function startRun() {
         ? (($("#post-update-cmd").value || "").trim())
         : "";
     const pruneDockerBeforePostUpdate = doPrune;
+    const sendUpload = state.upload && (
+        doApp
+        || doProperties
+        || (warmCache && doWarmApp)
+    );
 
-    // Only send upload when Step 2 is selected and not skipped.
-    const sendUpload = doApp && !state.skipStep2 && state.upload;
+    if (!warmCache) {
+        const actions = [];
+        if (doWifi) actions.push("configure WiFi and device password");
+        if (doProperties) actions.push("complete App Lab onboarding");
+        if (doSetup) actions.push("update system and App Lab software");
+        if (doApp) actions.push(`copy ${state.upload.folder_name}`);
+        if (doPrune) actions.push("remove unused Docker data");
+        if (doPostUpdate) actions.push("run custom commands");
+        const prompt = `Set up ${devices.length} board${devices.length === 1 ? "" : "s"}?\n\n${actions.map((action) => `• ${action}`).join("\n")}\n\nAll connected boards start together.`;
+        if (!window.confirm(prompt)) return;
+    }
 
-    resetAllCards();
+    if (targetSerial) resetCard(targetSerial);
+    else resetAllCards();
 
     const r = await fetch("/api/runs", {
         method: "POST",
@@ -557,6 +1100,10 @@ async function startRun() {
             devices,
             post_update_cmd: postUpdateCmd || null,
             prune_docker_before_post_update: pruneDockerBeforePostUpdate,
+            use_package_cache: usePackageCache,
+            warm_cache: warmCache,
+            prepare_uploaded_app: warmCache && doWarmApp,
+            example_apps: warmCache ? selectedExampleIds() : [],
         }),
     });
     if (!r.ok) {
@@ -566,7 +1113,9 @@ async function startRun() {
     }
     const j = await r.json();
     state.runId = j.run_id;
-    $("#run-status").textContent = `Run ${j.run_id} in progress…`;
+    $("#run-status").textContent = warmCache
+        ? `Preparing and saving cache from ${targetSerial}…`
+        : `Run ${j.run_id} in progress…`;
     updateStartButtons();
     openWs(j.run_id);
 }
@@ -578,10 +1127,11 @@ function collectSkip(serial) {
 }
 
 async function retryDevice(serial) {
-    if (!state.runId) return;
+    const runId = state.cards.get(serial)?.runId || state.runId;
+    if (!runId) return;
     const skip = collectSkip(serial);
     resetCard(serial);
-    const r = await fetch(`/api/runs/${state.runId}/devices/${serial}/retry`, {
+    const r = await fetch(`/api/runs/${runId}/devices/${serial}/retry`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ skip_stages: skip }),
@@ -589,7 +1139,12 @@ async function retryDevice(serial) {
     if (!r.ok) {
         const j = await r.json().catch(() => ({}));
         appendLog(serial, `retry failed: ${j.detail || r.status}`, "err");
+        return;
     }
+    state.runId = runId;
+    state.runFinalStatusText = null;
+    updateStartButtons();
+    openWs(runId);
 }
 
 async function identifyDevice(serial) {
@@ -693,6 +1248,11 @@ async function wifiCheckAllDevices() {
 // ---------- WebSocket ----------
 
 function openWs(runId) {
+    if (state.ws) {
+        state.ws.onclose = null;
+        state.ws.onerror = null;
+        state.ws.close();
+    }
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws/runs/${runId}`);
     state.ws = ws;
@@ -702,6 +1262,8 @@ function openWs(runId) {
         handleEvent(ev);
     };
     ws.onclose = () => {
+        if (state.ws !== ws) return;
+        state.ws = null;
         if (state.runId !== null && !state.runFinalStatusText) {
             $("#run-status").textContent =
                 `run ${runId} disconnected before completion`; 
@@ -715,14 +1277,60 @@ function openWs(runId) {
     ws.onerror = () => console.log("ws error");
 }
 
+async function diagnoseWithCopilot(serial) {
+    const c = state.cards.get(serial);
+    if (!c) return;
+
+    const allLogs = c.logEl.innerText.trim();
+    const recentLogs = allLogs.slice(-12000) || "No device log output was captured.";
+    const failureReason = c.failureEl.textContent.trim() || "No failure reason was reported.";
+    const prompt = [
+        "Diagnose and fix this failed Arduino UNO Q setup run.",
+        "Inspect the current uno-q-flasher workspace, identify the root cause from the logs, implement the smallest robust fix, validate it locally, and retry only this board when hardware verification is necessary. Do not run a fleet-wide update.",
+        "",
+        `Board ID: ${serial}`,
+        `Run ID: ${c.runId || state.runId || "unknown"}`,
+        `Failure reason: ${failureReason}`,
+        "",
+        "Recent board logs:",
+        "```text",
+        recentLogs,
+        "```",
+    ].join("\n");
+
+    c.diagnoseBtn.disabled = true;
+    c.diagnoseBtn.textContent = "Opening Copilot...";
+    try {
+        const response = await fetch("/api/copilot/diagnose", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt }),
+        });
+        if (response.ok) return;
+        const body = await response.json().catch(() => ({}));
+        try { await navigator.clipboard.writeText(prompt); } catch (_) { /* no-op */ }
+        appendLog(serial, `Could not open Copilot: ${body.detail || response.status}. Prompt copied to clipboard.`, "err");
+    } catch (error) {
+        try { await navigator.clipboard.writeText(prompt); } catch (_) { /* no-op */ }
+        appendLog(serial, `Could not open Copilot: ${error.message}. Prompt copied to clipboard.`, "err");
+    } finally {
+        c.diagnoseBtn.disabled = false;
+        window.setTimeout(() => {
+            c.diagnoseBtn.textContent = "Diagnose and fix with Copilot";
+        }, 1500);
+    }
+}
+
 function handleEvent(ev) {
     switch (ev.type) {
         case "device_started": {
             const c = state.cards.get(ev.device);
             if (!c) return;
+            c.runId = state.runId;
             c.badgeEl.dataset.status = "running";
             c.badgeEl.textContent = "running";
             c.retryBtn.hidden = true;
+            c.diagnoseBtn.hidden = true;
             c.failureEl.hidden = true;
             c.summaryEl.hidden = false;
             c.summary = makeSummaryState();
@@ -741,6 +1349,7 @@ function handleEvent(ev) {
             // live timer running (elapsed accumulates across attempts).
             c.badgeEl.dataset.status = "running";
             c.badgeEl.textContent = `retry ${ev.attempt}/${ev.max_attempts}`;
+            c.diagnoseBtn.hidden = true;
             c.failureEl.hidden = true;
             c.summaryEl.hidden = false;
             c.summary = makeSummaryState();
@@ -814,6 +1423,7 @@ function handleEvent(ev) {
             }
             if (ev.result === "failed") {
                 c.retryBtn.hidden = false;
+                c.diagnoseBtn.hidden = false;
             } else {
                 c.progressEl.style.width = "100%";
             }
@@ -838,6 +1448,7 @@ function handleEvent(ev) {
             $("#run-status").textContent = state.runFinalStatusText;
             state.runId = null;
             updateStartButtons();
+            verifyWorkshopCache();
             break;
         }
     }
@@ -988,6 +1599,7 @@ function resetCard(serial) {
     c.logEl.innerHTML = "";
     if (c.logFollowState) c.logFollowState.follow = true;
     c.retryBtn.hidden = true;
+    c.diagnoseBtn.hidden = true;
     c.failureEl.hidden = true;
     c.summaryEl.hidden = true;
     c.summary = makeSummaryState();

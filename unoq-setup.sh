@@ -1,20 +1,37 @@
 #!/bin/bash
 
 # ── Timer & error tracking ────────────────────────────────────────────────────
-START_TIME=$(date +%s)
+START_TIME=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || date +%s)
 ERRORS=()
 
 log() {
     echo "[UNOQ-SETUP] $1"
 }
 
+export TMPDIR=/tmp
+
+# ADB exports Android's /data/local/tmp even though UNO Q runs Linux and has
+# no /data mount. App CLI uses TMPDIR while preparing sketches and apps.
 add_error() {
     ERRORS+=("$1")
     log "ERROR: $1"
 }
 
+APT_SOURCES_BACKUP="/tmp/unoq-apt-sources.tar"
+APT_CACHE_CONFIGURED=0
+
+restore_apt_sources() {
+    if [ "$APT_CACHE_CONFIGURED" -ne 1 ] || [ ! -f "$APT_SOURCES_BACKUP" ]; then
+        return 0
+    fi
+    log "Restoring original APT sources..."
+    run_sudo_cmd "tar -C /etc/apt -xf '$APT_SOURCES_BACKUP' && rm -f '$APT_SOURCES_BACKUP'" \
+        || log "WARNING: could not restore original APT sources"
+    APT_CACHE_CONFIGURED=0
+}
+
 print_summary() {
-    END_TIME=$(date +%s)
+    END_TIME=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || date +%s)
     ELAPSED=$((END_TIME - START_TIME))
     MINS=$((ELAPSED / 60))
     SECS=$((ELAPSED % 60))
@@ -36,8 +53,13 @@ print_summary() {
     echo "╚══════════════════════════════════════════════════╝"
 }
 
-# Always print summary on exit (normal or error)
-trap print_summary EXIT
+cleanup_on_exit() {
+    restore_apt_sources
+    print_summary
+}
+
+# Always restore temporary configuration and print a summary.
+trap cleanup_on_exit EXIT
 
 # ── Load environment variables ────────────────────────────────────────────────
 if [ -f /home/arduino/.env ]; then
@@ -45,7 +67,7 @@ if [ -f /home/arduino/.env ]; then
     set -a
     . /home/arduino/.env
     set +a
-    env | grep UNOQ_
+    log "Loaded UNO Q settings (values hidden)."
 else
     log "/home/arduino/.env file not found."
 fi
@@ -123,10 +145,141 @@ run_and_log() {
     return ${PIPESTATUS[0]}
 }
 
+sync_clock_from_host() {
+    local board_epoch skew
+
+    if ! [[ "${UNOQ_HOST_EPOCH:-}" =~ ^[0-9]{10,}$ ]]; then
+        add_error "Host time was not provided; refusing package verification with an unknown clock."
+        return 1
+    fi
+
+    board_epoch=$(date +%s 2>/dev/null || echo 0)
+    skew=$((board_epoch - UNOQ_HOST_EPOCH))
+    [ "$skew" -ge 0 ] || skew=$((-skew))
+    if [ "$skew" -le 30 ]; then
+        log "System clock is already aligned with the host ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))."
+    else
+        log "Correcting system clock from host time (board was ${skew}s out)..."
+        if ! run_sudo_cmd "date -u -s '@$UNOQ_HOST_EPOCH' >/dev/null"; then
+            add_error "Could not set the board clock; APT signatures cannot be verified safely."
+            return 1
+        fi
+        log "System clock corrected to $(date -u '+%Y-%m-%dT%H:%M:%SZ')."
+    fi
+
+    # Keep the clock accurate after WiFi becomes available. Setting the host
+    # epoch above is the authoritative bootstrap and does not depend on NTP.
+    run_sudo_cmd "timedatectl set-ntp true" >/dev/null 2>&1 || true
+
+    board_epoch=$(date +%s 2>/dev/null || echo 0)
+    skew=$((board_epoch - UNOQ_HOST_EPOCH))
+    [ "$skew" -ge 0 ] || skew=$((-skew))
+    if [ "$skew" -gt 30 ]; then
+        add_error "Board clock is still ${skew}s away from host time after synchronization."
+        return 1
+    fi
+}
+
+if ! sync_clock_from_host; then
+    exit 1
+fi
+
+configure_apt_cache() {
+    if [ -z "${UNOQ_APT_CACHE_URL:-}" ]; then
+        log "No package cache configured; using repositories directly."
+        return 0
+    fi
+    if ! curl -fsS --max-time 5 "$UNOQ_APT_CACHE_URL/health" >/dev/null; then
+        add_error "Package cache is configured but unreachable at $UNOQ_APT_CACHE_URL"
+        return 1
+    fi
+    resolve_sudo_mode
+    if [ "$SUDO_MODE" = "none" ]; then
+        add_error "Cannot configure package cache: sudo unavailable"
+        return 1
+    fi
+
+    log "Routing APT repositories through USB package cache..."
+    run_sudo_cmd "rm -f '$APT_SOURCES_BACKUP'; cd /etc/apt; paths='sources.list.d'; [ ! -e sources.list ] || paths='sources.list sources.list.d'; tar -cf '$APT_SOURCES_BACKUP' \$paths" \
+        || return 1
+    run_sudo_cmd "grep -RIlE 'deb.debian.org|apt-repo.arduino.cc' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | xargs -r sed -i -e 's#http://deb.debian.org/#$UNOQ_APT_CACHE_URL/repository/http/deb.debian.org/#g' -e 's#https://apt-repo.arduino.cc#$UNOQ_APT_CACHE_URL/repository/https/apt-repo.arduino.cc#g'"
+    APT_CACHE_CONFIGURED=1
+}
+
 get_free_mb() {
     local avail_kb
     avail_kb=$(df -Pk / | awk 'NR==2 {print $4}')
     echo $((avail_kb / 1024))
+}
+
+ensure_app_lab_daemon() {
+    local version_output cli_version daemon_version wait_count
+    version_output=$(arduino-app-cli version 2>&1 || true)
+    cli_version=$(printf '%s\n' "$version_output" | sed -n 's/^Arduino App CLI version //p' | head -n 1)
+    daemon_version=$(printf '%s\n' "$version_output" | sed -n 's/^daemon version: //p' | head -n 1)
+    if [ -n "$cli_version" ] && [ "$cli_version" != "$daemon_version" ]; then
+        log "App Lab daemon version ${daemon_version:-unknown} differs from CLI $cli_version; restarting daemon..."
+        if ! run_sudo_cmd "systemctl restart arduino-app-cli.service"; then
+            add_error "Could not restart the App Lab daemon"
+            return 1
+        fi
+    fi
+
+    wait_count=0
+    until arduino-app-cli app list >/dev/null 2>&1; do
+        wait_count=$((wait_count + 1))
+        if [ "$wait_count" -ge 30 ]; then
+            add_error "App Lab daemon did not become ready within 30 seconds"
+            return 1
+        fi
+        sleep 1
+    done
+    log "App Lab daemon is ready (CLI ${cli_version:-unknown})."
+}
+
+wait_for_app_cli_internet() {
+    local count=0 max_wait=60
+    log "Checking direct internet connectivity for Arduino App CLI..."
+    until curl -fsS --max-time 5 --head https://downloads.arduino.cc >/dev/null 2>&1; do
+        count=$((count + 1))
+        if [ "$count" -ge "$max_wait" ]; then
+            add_error "Direct internet connectivity timeout before Arduino App CLI update"
+            return 1
+        fi
+        log "Arduino services not reachable yet, retrying... (${count}/${max_wait})"
+        sleep 1
+    done
+    log "Direct internet connectivity for Arduino App CLI confirmed."
+}
+
+UPDATE_TIMEOUT_SECONDS="${UNOQ_UPDATE_TIMEOUT_SECONDS:-2700}"
+
+run_app_cli_system_update() {
+    local attempt=1 max_attempts=3 output_file="/tmp/unoq-app-cli-update.log" status
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        : > "$output_file"
+        timeout "$UPDATE_TIMEOUT_SECONDS" arduino-app-cli system update --yes --only-arduino \
+            2>&1 | tee "$output_file"
+        status=${PIPESTATUS[0]}
+        if [ "$status" -eq 0 ]; then
+            rm -f "$output_file"
+            return 0
+        fi
+        if ! grep -Fq "no internet connection available" "$output_file" \
+            || [ "$attempt" -ge "$max_attempts" ]; then
+            rm -f "$output_file"
+            return "$status"
+        fi
+
+        attempt=$((attempt + 1))
+        log "Arduino App CLI connectivity check failed; retrying update (${attempt}/${max_attempts})..."
+        if ! wait_for_app_cli_internet; then
+            rm -f "$output_file"
+            return 1
+        fi
+        sleep 2
+    done
 }
 
 cleanup_before_updates() {
@@ -135,7 +288,9 @@ cleanup_before_updates() {
     before_mb=$(get_free_mb)
     log "Free space before cleanup: ${before_mb}MB"
 
-    if command -v docker >/dev/null 2>&1; then
+    if [ "$before_mb" -ge 1000 ] && [ "${UNOQ_FORCE_CLEANUP:-0}" != "1" ]; then
+        log "At least 1000MB is free; preserving Docker images for faster repeat runs."
+    elif command -v docker >/dev/null 2>&1; then
         run_and_log "docker" docker system df || true
         run_and_log "docker" docker container prune -f || true
         run_and_log "docker" docker image prune -a -f || true
@@ -230,7 +385,15 @@ if [ "$WIFI_DEV_READY" -ne 1 ]; then
 fi
 
 log "Checking if WiFi is already connected..."
-CURRENT_SSID=$(nmcli -t -f active,ssid dev wifi | grep '^yes:' | cut -d':' -f2)
+WIFI_IFACE=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi" {print $1; exit}')
+ACTIVE_WIFI_CONNECTION=""
+CURRENT_SSID=""
+if [ -n "$WIFI_IFACE" ]; then
+    ACTIVE_WIFI_CONNECTION=$(nmcli -g GENERAL.CONNECTION device show "$WIFI_IFACE" 2>/dev/null || true)
+    if [ -n "$ACTIVE_WIFI_CONNECTION" ] && [ "$ACTIVE_WIFI_CONNECTION" != "--" ]; then
+        CURRENT_SSID=$(nmcli -g 802-11-wireless.ssid connection show "$ACTIVE_WIFI_CONNECTION" 2>/dev/null || true)
+    fi
+fi
 if [ "$CURRENT_SSID" = "$UNOQ_WIFI_SSID" ]; then
     log "Already connected to WiFi SSID: $UNOQ_WIFI_SSID"
 else
@@ -238,8 +401,7 @@ else
     nmcli dev wifi rescan 2>/dev/null || true
 
     log "Connecting to WiFi..."
-    wifi_command="nmcli dev wifi connect $UNOQ_WIFI_SSID password $UNOQ_WIFI_PASSWORD"
-    log "WiFi command: $wifi_command"
+    log "Running nmcli dev wifi connect for SSID: $UNOQ_WIFI_SSID"
 
     # Retry budget: up to 15 * 4s = 60s. Covers "radio not up yet", "SSID not
     # seen in the first scan", and slow driver init after a cold boot.
@@ -249,12 +411,30 @@ else
     WIFI_CONNECTED=0
 
     while [ "$WIFI_ATTEMPT" -le "$WIFI_RETRY_MAX" ]; do
-        WIFI_OUTPUT=$(nmcli dev wifi connect "$UNOQ_WIFI_SSID" password "$UNOQ_WIFI_PASSWORD" 2>&1)
+        WIFI_OUTPUT=$(nmcli dev wifi connect "$UNOQ_WIFI_SSID" password "$UNOQ_WIFI_PASSWORD" ${WIFI_IFACE:+ifname "$WIFI_IFACE"} 2>&1)
         WIFI_EXIT_CODE=$?
 
         if [ "$WIFI_EXIT_CODE" -eq 0 ]; then
             WIFI_CONNECTED=1
             break
+        fi
+
+        if echo "$WIFI_OUTPUT" | grep -Fq "802-11-wireless-security.key-mgmt: property is missing"; then
+            PROFILE_NAME="unoq-${WIFI_IFACE:-wifi}"
+            log "NetworkManager omitted WPA key management; creating an explicit WPA-PSK profile..."
+            nmcli connection delete "$PROFILE_NAME" >/dev/null 2>&1 || true
+            WIFI_OUTPUT=$(nmcli connection add type wifi ifname "${WIFI_IFACE:-'*'}" \
+                con-name "$PROFILE_NAME" ssid "$UNOQ_WIFI_SSID" \
+                wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$UNOQ_WIFI_PASSWORD" 2>&1)
+            WIFI_EXIT_CODE=$?
+            if [ "$WIFI_EXIT_CODE" -eq 0 ]; then
+                WIFI_OUTPUT=$(nmcli connection up "$PROFILE_NAME" 2>&1)
+                WIFI_EXIT_CODE=$?
+            fi
+            if [ "$WIFI_EXIT_CODE" -eq 0 ]; then
+                WIFI_CONNECTED=1
+                break
+            fi
         fi
 
         if echo "$WIFI_OUTPUT" | grep -Fq "No Wi-Fi device found."; then
@@ -308,19 +488,28 @@ log "Testing DNS resolution..."
 nslookup downloads.arduino.cc || log "DNS resolution failed, please check network settings."
 
 # ── Wait for internet ─────────────────────────────────────────────────────────
-log "Waiting for internet connectivity (HTTP check)..."
-MAX_WAIT=60
-COUNT=0
-until curl -s --max-time 5 --head https://downloads.arduino.cc > /dev/null 2>&1; do
-    COUNT=$((COUNT + 1))
-    if [ "$COUNT" -ge "$MAX_WAIT" ]; then
-        add_error "Internet connectivity timeout after ${MAX_WAIT}s"
+if [ -n "${UNOQ_APT_CACHE_URL:-}" ]; then
+    log "Checking USB package cache connectivity..."
+    if ! curl -fsS --max-time 5 "$UNOQ_APT_CACHE_URL/health" >/dev/null; then
+        add_error "USB package cache is unreachable"
         exit 1
     fi
-    log "Not reachable yet, retrying... (${COUNT}/${MAX_WAIT})"
-    sleep 1
-done
-log "Internet connectivity confirmed."
+    log "USB package cache connectivity confirmed."
+else
+    log "Waiting for internet connectivity (HTTP check)..."
+    MAX_WAIT=60
+    COUNT=0
+    until curl -s --max-time 5 --head https://downloads.arduino.cc > /dev/null 2>&1; do
+        COUNT=$((COUNT + 1))
+        if [ "$COUNT" -ge "$MAX_WAIT" ]; then
+            add_error "Internet connectivity timeout after ${MAX_WAIT}s"
+            exit 1
+        fi
+        log "Not reachable yet, retrying... (${COUNT}/${MAX_WAIT})"
+        sleep 1
+    done
+    log "Internet connectivity confirmed."
+fi
 
 # ── App brick permissions ─────────────────────────────────────────────────────
 # Make every .eim model under ArduinoApps executable. Missing files or a missing
@@ -351,6 +540,10 @@ fi
 # Detection: the installed alsa-ucm-conf version lacks the Arduino suffix.
 cleanup_before_updates
 
+if ! configure_apt_cache; then
+    exit 1
+fi
+
 FREE_MB=$(get_free_mb)
 if [ "$FREE_MB" -lt 300 ]; then
     add_error "Only ${FREE_MB}MB free on / after cleanup. Need at least 300MB for package index updates."
@@ -358,6 +551,7 @@ if [ "$FREE_MB" -lt 300 ]; then
 fi
 
 ALSA_VERSION=$(dpkg-query -W -f='${Version}' alsa-ucm-conf 2>/dev/null || true)
+SYSTEM_UPDATE_COMPLETED=0
 if echo "$ALSA_VERSION" | grep -qE '^1\.2\.14-1$'; then
     log "Detected broken alsa-ucm-conf ($ALSA_VERSION). Running apt remediation..."
     resolve_sudo_mode
@@ -376,15 +570,35 @@ if echo "$ALSA_VERSION" | grep -qE '^1\.2\.14-1$'; then
     fi
 
     log "Remediation complete. Running Arduino-only system update..."
-    if ! arduino-app-cli system update --yes --only-arduino; then
+    if ! wait_for_app_cli_internet; then
+        exit 1
+    elif ! run_app_cli_system_update; then
         add_error "arduino-app-cli system update (remediation) failed"
+    else
+        SYSTEM_UPDATE_COMPLETED=1
     fi
 else
     log "apt state looks healthy (alsa-ucm-conf=${ALSA_VERSION:-not installed})."
 fi
 
 # ── System update ─────────────────────────────────────────────────────────────
-log "Running arduino-app-cli system update..."
-if ! arduino-app-cli system update --yes --only-arduino; then
-   add_error "arduino-app-cli system update failed"
+if [ "$SYSTEM_UPDATE_COMPLETED" -eq 1 ]; then
+    log "Arduino system update already completed during remediation; skipping duplicate pass."
+else
+    log "Running arduino-app-cli system update..."
+    if ! wait_for_app_cli_internet; then
+        exit 1
+    elif ! run_app_cli_system_update; then
+       add_error "arduino-app-cli system update failed"
+    fi
+fi
+
+restore_apt_sources
+
+if [ ${#ERRORS[@]} -eq 0 ]; then
+    ensure_app_lab_daemon || true
+fi
+
+if [ ${#ERRORS[@]} -gt 0 ]; then
+    exit 1
 fi
