@@ -27,6 +27,7 @@ restore_apt_sources() {
     log "Restoring original APT sources..."
     run_sudo_cmd "tar -C /etc/apt -xf '$APT_SOURCES_BACKUP' && rm -f '$APT_SOURCES_BACKUP'" \
         || log "WARNING: could not restore original APT sources"
+    unproxy_apt_sources || log "WARNING: could not remove package-cache URLs from APT sources"
     APT_CACHE_CONFIGURED=0
 }
 
@@ -263,6 +264,43 @@ wait_for_app_cli_internet() {
 
 UPDATE_TIMEOUT_SECONDS="${UNOQ_UPDATE_TIMEOUT_SECONDS:-2700}"
 
+# Ubuntu's unattended-upgrades starts as soon as a freshly connected board has
+# network and a sane clock, and holds the dpkg lock the App CLI update needs.
+# Stop the timers for this session. While no dpkg process is running it is
+# only planning or downloading (its resolver can spin for 30+ minutes on these
+# images), so it is stopped outright; once dpkg is installing, wait for it.
+wait_for_dpkg_lock() {
+    local waited=0 max_wait="${UNOQ_DPKG_LOCK_WAIT_SECONDS:-900}" upgrade_pids
+    run_sudo_cmd "systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service" >/dev/null 2>&1 || true
+    while true; do
+        # Anchored so the pattern never matches this script's own commands.
+        upgrade_pids=$(pgrep -f '^/usr/bin/python3 /usr/bin/unattended-upgrade' | tr '\n' ' ')
+        if [ -n "${upgrade_pids// /}" ] && ! pgrep -x dpkg >/dev/null 2>&1; then
+            log "Stopping background unattended-upgrade (not installing anything yet)..."
+            run_sudo_cmd "kill -9 $upgrade_pids" >/dev/null 2>&1 || true
+            sleep 2
+        fi
+        if ! pgrep -f '^/usr/bin/python3 /usr/bin/unattended-upgrade' >/dev/null 2>&1 \
+            && ! pgrep -x apt-get >/dev/null 2>&1 \
+            && ! pgrep -x dpkg >/dev/null 2>&1; then
+            return 0
+        fi
+        if [ "$waited" -ge "$max_wait" ]; then
+            log "WARNING: another package manager is still running after ${max_wait}s; trying the update anyway."
+            return 0
+        fi
+        [ $((waited % 30)) -eq 0 ] && log "Waiting for a background package upgrade to finish before updating (${waited}s)..."
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
+# Undo the package-cache rewrite in place, so sources never stay pointed at the
+# USB cache even if a backup was taken after an earlier, interrupted run.
+unproxy_apt_sources() {
+    run_sudo_cmd "grep -RIlE 'http://(127\.0\.0\.1|localhost):[0-9]+/repository/' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | xargs -r sed -i -E 's#http://(127\.0\.0\.1|localhost):[0-9]+/repository/(https?)/#\2://#g'"
+}
+
 run_app_cli_system_update() {
     local attempt=1 max_attempts=3 output_file="/tmp/unoq-app-cli-update.log" status
 
@@ -274,6 +312,13 @@ run_app_cli_system_update() {
         if [ "$status" -eq 0 ]; then
             rm -f "$output_file"
             return 0
+        fi
+        if grep -Eq "Could not get lock|Unable to acquire the dpkg frontend lock" "$output_file" \
+            && [ "$attempt" -lt "$max_attempts" ]; then
+            attempt=$((attempt + 1))
+            log "dpkg is locked by another process; waiting, then retrying update (${attempt}/${max_attempts})..."
+            wait_for_dpkg_lock
+            continue
         fi
         if ! grep -Fq "no internet connection available" "$output_file" \
             || [ "$attempt" -ge "$max_attempts" ]; then
@@ -595,6 +640,7 @@ if [ "$SYSTEM_UPDATE_COMPLETED" -eq 1 ]; then
     log "Arduino system update already completed during remediation; skipping duplicate pass."
 else
     log "Running arduino-app-cli system update..."
+    wait_for_dpkg_lock
     if ! wait_for_app_cli_internet; then
         exit 1
     elif ! run_app_cli_system_update; then
