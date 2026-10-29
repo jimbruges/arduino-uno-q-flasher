@@ -10,6 +10,7 @@ const STAGES = [
     "run_setup",
     "prune_docker_images",
     "restore_workshop_cache",
+    "restore_models",
     "push_app",
     "prepare_uploaded_app",
     "prepare_examples",
@@ -25,17 +26,17 @@ const UI_PREFS_KEY = "unoq-flasher-ui-v1";
 const UI_UPLOAD_KEY = "unoq-flasher-upload-v1";
 const RECOMMENDED_EXAMPLES = [
     {
-        id: "examples:blink",
+        id: "examples:inspirational/blink",
         name: "Blink LED",
         description: "Blink LED from Python",
     },
     {
-        id: "examples:real-time-accelerometer",
+        id: "examples:inspirational/real-time-accelerometer",
         name: "Real-time Accelerometer",
         description: "Accelerometer inspiration",
     },
     {
-        id: "examples:inspirational/platform_unoq/edge-ai-assistant",
+        id: "examples:inspirational/edge-ai-assistant",
         name: "Edge AI Assistant",
         description: "Chatbot powered by a local LLM",
     },
@@ -411,8 +412,14 @@ function renderWorkshopCacheStatus(cache) {
     const runtime = cache.app_runtime_ready
         ? ` + ${formatBytes(cache.app_runtime_archive_bytes)} app cache`
         : "";
+    const apps = cache.apps_ready
+        ? ` + ${cache.apps.length} app${cache.apps.length === 1 ? "" : "s"} (${cache.apps.join(", ")})`
+        : "";
+    const models = cache.models_ready
+        ? ` + ${cache.models.length} model${cache.models.length === 1 ? "" : "s"} · ${formatBytes(cache.models_bytes)} (${cache.models.map((model) => model.path.split("/").pop()).join(", ")})`
+        : "";
     const integrity = state.cacheIntegrity === "verified" ? "verified · " : "";
-    el.textContent = `${integrity}${cache.images.length} images · ${formatBytes(cache.image_archive_bytes)}${toolchain}${runtime} · source ${cache.source_device}`;
+    el.textContent = `${integrity}${cache.images.length} images · ${formatBytes(cache.image_archive_bytes)}${toolchain}${runtime}${apps}${models} · source ${cache.source_device}`;
 }
 
 function renderWifiStep(health) {
@@ -669,7 +676,9 @@ async function refreshExamples() {
 }
 
 function selectedExampleIds() {
-    return state.examples.filter((example) => example.selected).map((example) => example.id);
+    return state.examples
+        .filter((example) => example.selected && example.status !== "not listed on this board")
+        .map((example) => example.id);
 }
 
 function renderExampleOptions() {
@@ -685,6 +694,8 @@ function renderExampleOptions() {
         const input = document.createElement("input");
         input.type = "checkbox";
         input.checked = example.selected;
+        const unavailable = example.status === "not listed on this board";
+        if (unavailable) input.disabled = true;
         input.addEventListener("change", () => {
             example.selected = input.checked;
             saveUiPreferences();
@@ -692,7 +703,9 @@ function renderExampleOptions() {
             updateRunStepState();
         });
         const text = document.createElement("span");
-        text.textContent = `${example.name} · ${example.id}`;
+        text.textContent = unavailable
+            ? `${example.name} · ${example.id} (not available on this board)`
+            : `${example.name} · ${example.id}`;
         label.append(input, text);
         container.appendChild(label);
     }
@@ -720,7 +733,7 @@ async function captureImageCache(serial) {
     const btn = c.captureCacheBtn;
     btn.disabled = true;
     btn.textContent = "Saving...";
-    appendLog(serial, "Capturing all tagged Docker images to the Mac cache...", "info");
+    appendLog(serial, "Capturing Docker images, toolchain, App Lab apps and models to the Mac cache (models can take several minutes)...", "info");
     try {
         const response = await fetch(`/api/cache/workshop/${encodeURIComponent(serial)}`, {
             method: "POST",
@@ -729,7 +742,7 @@ async function captureImageCache(serial) {
         if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
         appendLog(
             serial,
-            `Captured ${result.images.length} images, ${formatBytes(result.arduino_archive_bytes)} toolchain, and ${formatBytes(result.app_runtime_archive_bytes)} app cache.`,
+            `Captured ${result.images.length} images, ${formatBytes(result.arduino_archive_bytes)} toolchain, ${formatBytes(result.app_runtime_archive_bytes)} app cache, ${(result.apps || []).length} app(s), and ${(result.models || []).length} model(s) (${formatBytes(result.models_bytes || 0)}).`,
             "info",
         );
         await verifyWorkshopCache();
@@ -1054,7 +1067,7 @@ async function startRun(targetSerial = null, warmCache = false) {
     if (!doProperties) baseSkip.push("push_properties");
     if (!doSetup) baseSkip.push("push_setup_script", "chmod_script", "run_setup");
     if (!doPrune) baseSkip.push("prune_docker_images");
-    if (!usePackageCache) baseSkip.push("restore_workshop_cache");
+    if (!usePackageCache) baseSkip.push("restore_workshop_cache", "restore_models");
     if (!warmCache || !doWarmApp) baseSkip.push("prepare_uploaded_app");
     if (!doPostUpdate) baseSkip.push("post_update");
 

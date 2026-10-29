@@ -213,8 +213,22 @@ run can start and stop selected examples or an uploaded app, then captures:
 
 - tagged Docker images;
 - Arduino toolchain data;
-- prepared App Lab/example runtime caches; and
-- package URLs downloaded while warming the board.
+- prepared App Lab/example runtime caches;
+- the board's own App Lab apps in `/home/arduino/ArduinoApps` (sources);
+- every model under `/var/lib/arduino-app-cli/models` (for example the
+  VENTUNO Q `genai/qwen3_vl_8b_instruct-genie-w4a16-qualcomm_qcs8275` VLM); and
+- package URLs downloaded while warming the board (Debian, Ubuntu ports, and
+  Arduino APT repositories).
+
+Models are mirrored into `.cache/workshop/models/` one unit (`<family>/<name>`)
+at a time with a per-file size manifest, so re-capturing skips models that are
+already cached. A model already downloaded by a workshop's `pull-models.sh`
+(`$VLM_MODELS_DIR`, default `~/arduino-workshop-models`) is cloned from there
+instead of being pulled over USB again. On other boards, `restore_models` pushes
+only missing or mismatched models, checks free space first, verifies every file
+size, and only then moves the copy into place. `UNOQ_MODEL_PUSH_PARALLEL`
+(default 2) caps how many boards receive models at once. Cached apps replace
+same-named app folders on the target board.
 
 Artifacts are stored under `.cache/workshop/`. This is a reusable checkpoint,
 not a raw disk image. Captures are transactional: every archive and SHA-256
@@ -264,7 +278,9 @@ uploaded-app preparation needs both an upload and one-board warm-cache mode.
    then restore `model-bundles/` when present
 7. `prune_docker_images` — optional cleanup of unused Docker/Podman images and
    stopped containers before post-update (disabled by default)
-8. `restore_workshop_cache` — restore verified Docker and app-runtime caches
+8. `restore_workshop_cache` — restore verified Docker images, cached App Lab
+   apps, and app-runtime caches
+   - `restore_models` — copy cached models that are missing from the board
 9. `push_app` — push the chosen folder to `/home/arduino/ArduinoApps/`
 10. `prepare_uploaded_app` / `prepare_examples` — cache-board-only start/stop
 11. `post_update` — run configured workshop preparation commands in order;
@@ -376,6 +392,7 @@ interactive schema is available at <http://localhost:8000/docs>.
 | `POST /api/cache/verify` | Verify the workshop manifest and archives. |
 | `POST /api/cache/images/{serial}` | Capture Docker images from one board. |
 | `POST /api/cache/workshop/{serial}` | Capture the complete workshop cache. |
+| `POST /api/cache/models/{serial}` | Capture only the board's models. |
 | `GET /api/flashing/status` | EDL, image, disk-space, and tool status. |
 | `POST /api/flashing/start` | Start guarded one-board image recovery. |
 | `POST /api/flashing/cancel` | Cancel image recovery. |

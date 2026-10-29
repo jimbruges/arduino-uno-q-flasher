@@ -102,22 +102,27 @@ resolve_sudo_mode() {
         return 0
     fi
 
-    for CANDIDATE in "${UNOQ_DEFAULT_PASSWORD:-}" "arduino"; do
-        [ -z "$CANDIDATE" ] && continue
+    local tried_labels=()
+    for CANDIDATE_LABEL in \
+        "configured device password:${UNOQ_DEFAULT_PASSWORD:-}" \
+        "factory default password 'arduino':arduino" \
+        "factory default password 'edgeimpulse':edgeimpulse" \
+        "factory default password 'opensource':opensource" \
+        "blank password:"; do
+        local LABEL="${CANDIDATE_LABEL%%:*}"
+        local CANDIDATE="${CANDIDATE_LABEL#*:}"
+        [ -z "$CANDIDATE" ] && [ "$LABEL" != "blank password" ] && continue
+        tried_labels+=("$LABEL")
         if printf '%s\n' "$CANDIDATE" | sudo -S -k -p '' true >/dev/null 2>&1; then
             SUDO_MODE="password"
             SUDO_PW="$CANDIDATE"
-            if [ "$CANDIDATE" = "arduino" ]; then
-                log "sudo check: using fallback sudo password candidate 'arduino'"
-            else
-                log "sudo check: using configured device password"
-            fi
+            log "sudo check: authenticated using $LABEL"
             return 0
         fi
     done
 
     SUDO_MODE="none"
-    log "WARNING: sudo is not available non-interactively; privileged maintenance steps will be skipped."
+    log "WARNING: sudo is not available non-interactively (tried: ${tried_labels[*]}); privileged maintenance steps will be skipped."
 }
 
 run_sudo_cmd() {
@@ -161,7 +166,11 @@ sync_clock_from_host() {
     else
         log "Correcting system clock from host time (board was ${skew}s out)..."
         if ! run_sudo_cmd "date -u -s '@$UNOQ_HOST_EPOCH' >/dev/null"; then
-            add_error "Could not set the board clock; APT signatures cannot be verified safely."
+            if [ "$SUDO_MODE" = "none" ]; then
+                add_error "Could not set the board clock: no sudo credentials for this board matched UNOQ_DEFAULT_PASSWORD or the factory default. The board's arduino-user password likely differs from what this host has configured. Verify/reset the password on the board directly, update UNOQ_DEFAULT_PASSWORD to match, then retry this board."
+            else
+                add_error "Could not set the board clock; APT signatures cannot be verified safely."
+            fi
             return 1
         fi
         log "System clock corrected to $(date -u '+%Y-%m-%dT%H:%M:%SZ')."
@@ -202,7 +211,7 @@ configure_apt_cache() {
     log "Routing APT repositories through USB package cache..."
     run_sudo_cmd "rm -f '$APT_SOURCES_BACKUP'; cd /etc/apt; paths='sources.list.d'; [ ! -e sources.list ] || paths='sources.list sources.list.d'; tar -cf '$APT_SOURCES_BACKUP' \$paths" \
         || return 1
-    run_sudo_cmd "grep -RIlE 'deb.debian.org|apt-repo.arduino.cc' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | xargs -r sed -i -e 's#http://deb.debian.org/#$UNOQ_APT_CACHE_URL/repository/http/deb.debian.org/#g' -e 's#https://apt-repo.arduino.cc#$UNOQ_APT_CACHE_URL/repository/https/apt-repo.arduino.cc#g'"
+    run_sudo_cmd "grep -RIlE 'deb.debian.org|ports.ubuntu.com|apt-repo.arduino.cc' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | xargs -r sed -i -e 's#http://deb.debian.org/#$UNOQ_APT_CACHE_URL/repository/http/deb.debian.org/#g' -e 's#http://ports.ubuntu.com/#$UNOQ_APT_CACHE_URL/repository/http/ports.ubuntu.com/#g' -e 's#https://apt-repo.arduino.cc#$UNOQ_APT_CACHE_URL/repository/https/apt-repo.arduino.cc#g'"
     APT_CACHE_CONFIGURED=1
 }
 

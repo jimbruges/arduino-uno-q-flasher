@@ -57,6 +57,14 @@ FLASH_IMAGE_CACHE_DIR = PROJECT_ROOT / ".cache" / "flasher-images"
 registry = Registry(uploads_dir=UPLOADS_DIR)
 package_cache = PackageCache(cache_dir=CACHE_DIR)
 workshop_cache = WorkshopCache(root=WORKSHOP_CACHE_DIR)
+# Models already downloaded by a workshop's pull-models.sh are cloned into the
+# cache instead of being pulled from the reference board again.
+MODEL_SEED_DIRS = tuple(
+    Path(path).expanduser()
+    for path in dict.fromkeys(
+        filter(None, (os.environ.get("VLM_MODELS_DIR"), "~/arduino-workshop-models"))
+    )
+)
 flash_lock = asyncio.Lock()
 flash_state: dict = {
     "status": "idle",
@@ -507,11 +515,7 @@ async def devices() -> dict:
     return {"devices": [{"serial": d.serial, "state": d.state} for d in ds]}
 
 
-@app.get("/api/devices/{serial}/examples")
-async def device_examples(serial: str) -> dict:
-    online = {device.serial for device in await adb.list_devices()}
-    if serial not in online:
-        raise HTTPException(status_code=404, detail="device is not online")
+async def _list_device_examples(serial: str) -> list[dict]:
     rc, output = await adb.shell(serial, "arduino-app-cli app list --format json")
     if rc != 0:
         raise HTTPException(status_code=502, detail=output or "could not list examples")
@@ -538,6 +542,15 @@ async def device_examples(serial: str) -> dict:
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=502, detail=f"invalid App CLI response: {exc}") from exc
     examples.sort(key=lambda item: (not item["inspirational"], item["name"].lower()))
+    return examples
+
+
+@app.get("/api/devices/{serial}/examples")
+async def device_examples(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    examples = await _list_device_examples(serial)
     return {"device": serial, "examples": examples}
 
 
@@ -571,9 +584,21 @@ async def capture_workshop_cache(serial: str) -> dict:
     if serial not in online:
         raise HTTPException(status_code=404, detail="device is not online")
     try:
-        return await workshop_cache.capture_all(serial)
+        return await workshop_cache.capture_all(serial, seed_dirs=MODEL_SEED_DIRS)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/cache/models/{serial}")
+async def capture_model_cache(serial: str) -> dict:
+    online = {device.serial for device in await adb.list_devices()}
+    if serial not in online:
+        raise HTTPException(status_code=404, detail="device is not online")
+    try:
+        await workshop_cache.capture_models(serial, seed_dirs=MODEL_SEED_DIRS)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return await workshop_cache.verify()
 
 
 # Blink the red user LED ~5s to physically identify the board on a bench full
@@ -845,6 +870,25 @@ async def start_run(req: StartRunRequest) -> dict:
     ]
     if invalid_examples:
         raise HTTPException(status_code=400, detail="invalid example app ID")
+    if req.warm_cache and req.example_apps:
+        # example_apps may still reference a stale/previous board's list (the UI keeps
+        # unavailable recommended examples selected); confirm against this board's own
+        # `app list` before starting, since prepare_examples treats every id as required.
+        target_serial = req.devices[0].serial
+        available_ids = {
+            example["id"] for example in await _list_device_examples(target_serial)
+        }
+        missing_examples = [
+            app_id for app_id in req.example_apps if app_id not in available_ids
+        ]
+        if missing_examples:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "example app(s) not available on this board: "
+                    f"{', '.join(missing_examples)}"
+                ),
+            )
 
     app_push_requested = any("push_app" not in device.skip_stages for device in req.devices)
     if app_push_requested and upload is None:
@@ -910,7 +954,12 @@ async def start_run(req: StartRunRequest) -> dict:
     async def capture_after_success(serial: str, emit) -> tuple[bool, str | None]:
         await emit(StageEvent(device=serial, stage="capture_cache", status="started"))
         try:
-            result = await workshop_cache.capture_all(serial)
+            async def progress(line: str) -> None:
+                await emit(LogEvent(device=serial, stage="capture_cache", line=line))
+
+            result = await workshop_cache.capture_all(
+                serial, log=progress, seed_dirs=MODEL_SEED_DIRS
+            )
         except RuntimeError as exc:
             await emit(
                 LogEvent(
@@ -932,7 +981,10 @@ async def start_run(req: StartRunRequest) -> dict:
                 line=(
                     f"Captured {len(result.get('images', []))} Docker images, "
                     f"{result.get('arduino_archive_bytes', 0)} bytes of Arduino data, "
-                    f"and {result.get('app_runtime_archive_bytes', 0)} bytes of app caches."
+                    f"{result.get('app_runtime_archive_bytes', 0)} bytes of app caches, "
+                    f"{len(result.get('apps', []))} App Lab app(s), and "
+                    f"{len(result.get('models', []))} model(s) "
+                    f"({result.get('models_bytes', 0) // (1024 * 1024)} MB)."
                 ),
             )
         )

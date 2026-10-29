@@ -102,6 +102,17 @@ async def push(
     )
 
 
+async def pull(
+    serial: str,
+    remote: str,
+    local: Path,
+    on_line: LineCallback | None = None,
+) -> tuple[int, str]:
+    return await _run_streaming(
+        ["-s", serial, "pull", remote, str(local)], on_line
+    )
+
+
 async def shell(
     serial: str,
     command: str,

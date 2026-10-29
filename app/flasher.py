@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -29,6 +30,14 @@ from .events import (
 )
 from .parser import SetupOutputParser
 from .package_cache import CACHE_PORT
+from .workshop_cache import (
+    APPS_ARCHIVE_NAME,
+    MANIFEST_NAME,
+    MODELS_DIR_NAME,
+    REMOTE_MODEL_LISTING_CMD,
+    REMOTE_MODELS_ROOT,
+    group_model_files,
+)
 
 EmitFn = Callable[[Event], Awaitable[None]]
 AfterSuccessFn = Callable[[str, EmitFn], Awaitable[tuple[bool, str | None]]]
@@ -49,6 +58,10 @@ REMOTE_MODEL_STAGING_DIR = "/home/arduino/.unoq-model-bundles"
 DOCKER_IMAGE_ARCHIVE = Path(".cache/workshop/docker-images.tar")
 ARDUINO_DATA_ARCHIVE = Path(".cache/workshop/arduino-data.tar.gz")
 APP_RUNTIME_ARCHIVE = Path(".cache/workshop/app-runtime.tar.gz")
+APPS_ARCHIVE = Path(".cache/workshop") / APPS_ARCHIVE_NAME
+MODELS_CACHE_DIR = Path(".cache/workshop") / MODELS_DIR_NAME
+# Free space kept on the board's rootfs after copying cached models.
+MODEL_FREE_SPACE_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
 
 PASSWORD_SUCCESS_RE = re.compile(
     r"password updated successfully"
@@ -63,6 +76,10 @@ PASSWORD_NEEDS_CURRENT_RE = re.compile(
 PASSWORD_TOKEN_ERROR_RE = re.compile(
     r"authentication token manipulation error", re.IGNORECASE
 )
+
+# Known default passwords seen across UNO Q board images, tried as fallbacks
+# alongside the configured UNOQ_DEFAULT_PASSWORD.
+FALLBACK_SUDO_PASSWORDS = ("arduino", "edgeimpulse", "opensource")
 
 # Set the green + red user LEDs to a solid on/off state at the end of a flash.
 # Two shell vars ($GREEN, $RED) are prepended when invoked so the script itself
@@ -153,6 +170,11 @@ class FlasherContext:
         self.use_package_cache = use_package_cache
         self.update_semaphore = asyncio.Semaphore(max_parallel_updates)
         self.artifact_semaphore = asyncio.Semaphore(2)
+        # Model pushes are multi-GB; cap how many share the USB bus at once so
+        # each board finishes in a predictable time.
+        self.model_semaphore = asyncio.Semaphore(
+            max(1, int(os.environ.get("UNOQ_MODEL_PUSH_PARALLEL", "2") or 2))
+        )
         self.prepare_uploaded_app = prepare_uploaded_app
         self.example_apps = tuple(example_apps or ())
 
@@ -188,6 +210,33 @@ class FlasherContext:
     def app_runtime_archive(self) -> Path | None:
         candidate = self.project_root / APP_RUNTIME_ARCHIVE
         return candidate if candidate.is_file() else None
+
+    @property
+    def apps_archive(self) -> Path | None:
+        candidate = self.project_root / APPS_ARCHIVE
+        return candidate if candidate.is_file() else None
+
+    @property
+    def models_cache_dir(self) -> Path:
+        return self.project_root / MODELS_CACHE_DIR
+
+    @property
+    def model_units(self) -> list[dict]:
+        """Cached model units ({path, bytes, files}) captured from a reference board."""
+        try:
+            manifest = json.loads(
+                (self.models_cache_dir / MANIFEST_NAME).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return []
+        return [
+            unit
+            for unit in manifest.get("units", [])
+            if isinstance(unit.get("path"), str)
+            and re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?", unit["path"])
+            and ".." not in unit["path"].split("/")
+            and isinstance(unit.get("files"), dict)
+        ]
 
 
 async def flash_device(
@@ -441,7 +490,7 @@ async def _run_stages(
         if rc != 0:
             for password in dict.fromkeys(
                 candidate
-                for candidate in (ctx.unoq_default_password, "arduino")
+                for candidate in (ctx.unoq_default_password, *FALLBACK_SUDO_PASSWORDS)
                 if candidate
             ):
                 rc, _ = await adb.shell(
@@ -734,7 +783,7 @@ async def _run_stages(
             f"chown -R arduino:arduino {REMOTE_MODELS_DIR} && "
             f"rm -rf {REMOTE_MODEL_STAGING_DIR}"
         )
-        sudo_candidates = [ctx.unoq_default_password, "arduino"]
+        sudo_candidates = [ctx.unoq_default_password, *FALLBACK_SUDO_PASSWORDS]
         rc, _ = await adb.shell(
             serial,
             f"sudo -n bash -lc {shlex.quote(install_cmd)}",
@@ -804,13 +853,61 @@ async def _run_stages(
     async def stage_restore_workshop_cache() -> bool:
         if not await restore_workshop_images("restore_workshop_cache"):
             return False
+        cb = await line_cb_for("restore_workshop_cache")
+        apps_archive = ctx.apps_archive
+        if apps_archive is not None:
+            apps_manifest = _read_json(apps_archive.with_name("manifest.json"))
+            digest = apps_manifest.get("apps_sha256") or await asyncio.to_thread(
+                _file_sha256, apps_archive
+            )
+            apps = [
+                name
+                for name in apps_manifest.get("apps", [])
+                if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9._ -]+", name)
+                and name not in {".", ".."}
+            ]
+            marker = f"/home/arduino/.unoq-apps-cache-{digest}"
+            rc, _ = await adb.shell(serial, f"test -f {shlex.quote(marker)}")
+            if rc == 0:
+                await log(
+                    "Cached App Lab apps are already present; skipping transfer.",
+                    stage="restore_workshop_cache",
+                )
+            else:
+                await log(
+                    f"Restoring {len(apps)} cached App Lab app(s): {', '.join(apps)}",
+                    stage="restore_workshop_cache",
+                )
+                # Replace each cached app outright so files deleted on the
+                # reference board do not linger, and force the app runtime
+                # cache below to be re-extracted into the fresh folders.
+                removals = " ".join(
+                    shlex.quote(f"{APPS_TARGET_DIR}{name}") for name in apps
+                )
+                rc, _ = await adb.shell(
+                    serial,
+                    f"mkdir -p {APPS_TARGET_DIR} && "
+                    + (f"rm -rf -- {removals} && " if removals else "")
+                    + "rm -f /var/lib/arduino-app-cli/.unoq-app-cache-*",
+                    cb,
+                )
+                if rc != 0:
+                    return False
+                async with ctx.artifact_semaphore:
+                    rc, _ = await adb.stream_file_to_shell(
+                        serial,
+                        apps_archive,
+                        "tar --touch -xzf - -C /home/arduino",
+                        cb,
+                    )
+                if rc != 0:
+                    return False
+                rc, _ = await adb.shell(serial, f"touch {shlex.quote(marker)}", cb)
+                if rc != 0:
+                    return False
         runtime_archive = ctx.app_runtime_archive
         if runtime_archive is None:
             return True
-        import hashlib
-        import json
-
-        cb = await line_cb_for("restore_workshop_cache")
         manifest_path = runtime_archive.with_name("manifest.json")
         digest = ""
         try:
@@ -857,6 +954,119 @@ async def _run_stages(
         required=True,
     ):
         return False, "Failed to restore cached workshop artifacts."
+
+    # 8b. Copy cached models (e.g. the VLM used by workshop apps) onto the board.
+    async def stage_restore_models() -> bool:
+        units = ctx.model_units
+        if not units:
+            await log("No cached models; skipping.", stage="restore_models")
+            return True
+        cb = await line_cb_for("restore_models")
+        rc, output = await adb.shell(serial, REMOTE_MODEL_LISTING_CMD)
+        present = group_model_files(output) if rc == 0 else {}
+        pending = []
+        for unit in units:
+            on_board = present.get(unit["path"], {})
+            if all(on_board.get(rel) == size for rel, size in unit["files"].items()):
+                await log(
+                    f"Model {unit['path']} is already on the board; skipping.",
+                    stage="restore_models",
+                )
+            else:
+                pending.append(unit)
+        if not pending:
+            return True
+
+        needed = sum(int(unit["bytes"]) for unit in pending)
+        rc, output = await adb.shell(
+            serial,
+            f"mkdir -p {REMOTE_MODELS_ROOT} && "
+            f"df -Pk {REMOTE_MODELS_ROOT} | awk 'NR==2 {{print $4}}'",
+        )
+        free_kb = output.strip().splitlines()[-1] if output.strip() else ""
+        if rc != 0 or not free_kb.isdigit():
+            await log(
+                f"Could not read free space under {REMOTE_MODELS_ROOT}: {output}",
+                stage="restore_models",
+                stream="stderr",
+            )
+            return False
+        if int(free_kb) * 1024 < needed + MODEL_FREE_SPACE_MARGIN_BYTES:
+            await log(
+                f"Not enough free space for cached models: need {needed // (1024 * 1024)} MB "
+                f"plus 2 GB headroom, board has {int(free_kb) // 1024} MB free.",
+                stage="restore_models",
+                stream="stderr",
+            )
+            return False
+
+        for unit in pending:
+            local = ctx.models_cache_dir / unit["path"]
+            if not local.exists():
+                await log(
+                    f"Cached model {unit['path']} is missing on this computer; "
+                    "capture the cache again.",
+                    stage="restore_models",
+                    stream="stderr",
+                )
+                return False
+            remote = f"{REMOTE_MODELS_ROOT}/{unit['path']}"
+            parent, name = remote.rsplit("/", 1)
+            partial = f"{parent}/.{name}.part"
+            rc, _ = await adb.shell(
+                serial,
+                f"rm -rf {shlex.quote(partial)} && mkdir -p {shlex.quote(parent)}",
+                cb,
+            )
+            if rc != 0:
+                return False
+            await log(
+                f"Copying model {unit['path']} ({int(unit['bytes']) // (1024 * 1024)} MB) "
+                "over USB...",
+                stage="restore_models",
+            )
+            async with ctx.model_semaphore:
+                started = time.monotonic()
+                rc, _ = await adb.push(serial, local, partial, cb)
+                elapsed = time.monotonic() - started
+            if rc != 0:
+                await adb.shell(serial, f"rm -rf {shlex.quote(partial)}")
+                return False
+            # Verify every file landed at its exact size before publishing it
+            # under the real name, so a cut-off push is never mistaken for done.
+            rc, output = await adb.shell(
+                serial,
+                f"find {shlex.quote(partial)} -type f -printf '%P\\t%s\\n'",
+            )
+            copied: dict[str, int] = {}
+            for line in output.splitlines():
+                rel, sep, size = line.rstrip("\r").rpartition("\t")
+                if sep and size.isdigit():
+                    copied[rel] = int(size)
+            if rc != 0 or any(copied.get(rel) != size for rel, size in unit["files"].items()):
+                await log(
+                    f"Model {unit['path']} did not copy completely; removing the partial copy.",
+                    stage="restore_models",
+                    stream="stderr",
+                )
+                await adb.shell(serial, f"rm -rf {shlex.quote(partial)}")
+                return False
+            rc, _ = await adb.shell(
+                serial,
+                f"rm -rf {shlex.quote(remote)} && mv {shlex.quote(partial)} {shlex.quote(remote)}",
+                cb,
+            )
+            if rc != 0:
+                return False
+            rate = int(unit["bytes"]) / max(elapsed, 0.001) / (1024 * 1024)
+            await log(
+                f"Model {unit['path']} copied and verified in {int(elapsed)}s ({rate:.0f} MB/s).",
+                stage="restore_models",
+            )
+        return True
+
+    if not await run_stage("restore_models", stage_restore_models, required=True):
+        return False, "Failed to copy cached models to the board."
 
     # 9. Push the app immediately before optionally preparing it.
     if ctx.app_folder is None:
@@ -1011,6 +1221,8 @@ async def _run_stages(
             "find /var/lib/arduino-app-cli/assets /home/arduino/.local/share/arduino-app-cli/assets -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null | grep -q .",
             "test $(df -Pk / | awk 'NR==2 {print $4}') -ge 204800",
         ]
+        for unit in ctx.model_units:
+            checks.append(f"test -e {shlex.quote(REMOTE_MODELS_ROOT + '/' + unit['path'])}")
         if ctx.model_bundle_dir is not None:
             checks.append(
                 f"test $(stat -c %s {REMOTE_MODELS_DIR}/llamacpp/unsloth/"
@@ -1027,6 +1239,22 @@ async def _run_stages(
     if not await run_stage("verify_ready", stage_verify_ready, required=True):
         return False, "Final App Lab readiness verification failed."
     return True, None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(4 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 async def _set_end_state_led(
@@ -1094,6 +1322,23 @@ async def _emit_summary(serial: str, parser: SetupOutputParser, emit: EmitFn) ->
     )
 
 
+async def _verify_sudo_access(serial: str, ctx: FlasherContext) -> str | None:
+    """Return a sudo credential that authenticates on `serial`, or None if none do."""
+    rc, _ = await adb.shell(serial, "sudo -n true")
+    if rc == 0:
+        return ""
+    for candidate in dict.fromkeys(
+        p for p in (ctx.unoq_default_password, *FALLBACK_SUDO_PASSWORDS) if p
+    ):
+        rc, _ = await adb.shell(
+            serial,
+            f"printf '%s\\n' {shlex.quote(candidate)} | sudo -S -k -p '' true",
+        )
+        if rc == 0:
+            return candidate
+    return None
+
+
 async def _change_password(
     serial: str,
     ctx: FlasherContext,
@@ -1133,8 +1378,9 @@ async def _change_password(
         current_candidates: list[tuple[str, str]] = []
         if new_pw:
             current_candidates.append((new_pw, "configured default password"))
-        if new_pw != "arduino":
-            current_candidates.append(("arduino", "factory default password 'arduino'"))
+        for fallback_pw in FALLBACK_SUDO_PASSWORDS:
+            if fallback_pw != new_pw:
+                current_candidates.append((fallback_pw, f"factory default password '{fallback_pw}'"))
 
         for current_pw, label in current_candidates:
             await log(
@@ -1153,7 +1399,7 @@ async def _change_password(
                 )
                 return True
             if PASSWORD_TOKEN_ERROR_RE.search(combined):
-                await log("Token manipulation error; password may already be changed.", stage="change_password")
+                await _log_token_error_verified(serial, ctx, log)
                 return True
             if re.search(r"password unchanged", combined, re.IGNORECASE):
                 # Try the next candidate before concluding it's already non-default.
@@ -1166,7 +1412,7 @@ async def _change_password(
         return True
 
     if PASSWORD_TOKEN_ERROR_RE.search(combined):
-        await log("Token manipulation error; password may already be changed.", stage="change_password")
+        await _log_token_error_verified(serial, ctx, log)
         return True
 
     await log(
@@ -1175,3 +1421,25 @@ async def _change_password(
     )
     # Treat as non-fatal, matching original script
     return True
+
+
+async def _log_token_error_verified(
+    serial: str,
+    ctx: FlasherContext,
+    log: Callable[..., Awaitable[None]],
+) -> None:
+    working = await _verify_sudo_access(serial, ctx)
+    if working is not None:
+        await log(
+            "Token manipulation error; verified the account already authenticates via sudo.",
+            stage="change_password",
+        )
+    else:
+        await log(
+            "Token manipulation error and sudo verification failed: neither UNOQ_DEFAULT_PASSWORD "
+            "nor the factory default 'arduino' authenticate on this board. Its password has drifted "
+            "from what this host has configured; verify/reset it on the board directly, then retry "
+            "this board.",
+            stage="change_password",
+            stream="stderr",
+        )

@@ -18,6 +18,7 @@ CACHE_PORT = 3142
 ALLOWED_UPSTREAMS = frozenset(
     {
         ("http", "deb.debian.org"),
+        ("http", "ports.ubuntu.com"),
         ("https", "apt-repo.arduino.cc"),
     }
 )
